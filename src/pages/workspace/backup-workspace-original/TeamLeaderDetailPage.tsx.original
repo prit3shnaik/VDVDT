@@ -1,0 +1,3531 @@
+import React, { Fragment, useCallback, useEffect, useMemo, useState, useRef } from 'react'
+import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom'
+import toast from 'react-hot-toast'
+import {
+  ArrowLeft,
+  ArrowLeftRight,
+  Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
+  ChevronsDown,
+  ChevronsUp,
+  Columns3,
+  Download,
+  Eye,
+  GripVertical,
+  Loader2,
+  MoreHorizontal,
+  Phone,
+  Printer,
+  RefreshCcw,
+  RotateCcw,
+  Search,
+  Trash2,
+  UserCog,
+  UserPlus,
+  Users,
+  X,
+} from 'lucide-react'
+import { PageHeader } from '../../components/common/PageHeader'
+import { ReportConfigModal, type ReportFieldItem } from '../../components/common/ReportConfigModal'
+import { TransferFamilyConfirmModal } from '../../components/common/TransferFamilyConfirmModal'
+import { VoterDetailDrawer } from '../../components/voters/VoterDetailDrawer'
+import {
+  saveBlob,
+  openPrintWindow,
+  type PrintStyleOptions,
+} from '../../lib/reportBuilder'
+import {
+  fetchLeaderFamilies,
+  buildLeaderPdfBlob,
+  type LeaderFamiliesData,
+} from '../../lib/leaderFamilyPdf'
+import type { TeamLeader, Voter } from '../../lib/types'
+import { supabase } from '../../lib/supabase'
+import { useAuth } from '../../hooks/useAuth'
+import { usePersistentState } from '../../hooks/usePersistentState'
+import { fetchAllPages } from '../../hooks/useMeetingData'
+import {
+  buildTeamLeaderDetailScope,
+  readTeamLeaderDetailCache,
+  writeTeamLeaderDetailCache,
+  clearTeamLeadersListCache,
+  clearUnassignedDataCache,
+  isOfficeLeader,
+  isShiftedLeader,
+  ensureOfficeLeader,
+  patchTeamLeadersListCacheForLeaders,
+  specialLeaderIdSet,
+  transferAssignments,
+  REFRESH_SKIP_MS,
+} from '../../lib/teamLeaderCache'
+import {
+  initials,
+  compactLookupValue,
+  tokenizeLookup,
+  matchesLookupTokens,
+  normalizeLookupValue,
+  escapeIlikePattern,
+  isLikelyEpicToken,
+  highlightMatch,
+} from '../../lib/searchUtils'
+
+const VISIBLE_COLUMNS_KEY = 'vote:teamleaderdetail:visibleColumns'
+const PAGE_SIZE_KEY = 'vote:teamleaderdetail:pageSize'
+const PRINT_FIELDS_KEY = 'vote:teamleaderdetail:printFields'
+const INCLUDE_FAMILY_MEMBERS_KEY = 'vote:teamleaderdetail:includeFamilyMembers'
+const PRINT_FONT_SIZE_KEY = 'vote:teamleaderdetail:printFontSize'
+const PRINT_BOLD_KEY = 'vote:teamleaderdetail:printBold'
+const EXPORT_BORDERS_KEY = 'vote:teamleaderdetail:exportBorders'
+const EXPORT_ROW_HEIGHT_KEY = 'vote:teamleaderdetail:exportRowHeight'
+const EXPORT_COL_WIDTH_KEY = 'vote:teamleaderdetail:exportColWidth'
+const COLUMN_WIDTHS_KEY = 'vote:teamleaderdetail:columnWidths'
+const COLUMN_RESIZE_MIN_WIDTH = 40
+
+type MemberColumnKey =
+  | 'srNo'
+  | 'photo'
+  | 'ward'
+  | 'partNo'
+  | 'section'
+  | 'sectionName'
+  | 'name'
+  | 'status'
+  | 'relativeName'
+  | 'relation'
+  | 'epicNo'
+  | 'houseNo'
+  | 'age'
+  | 'dob'
+  | 'contact1'
+  | 'contact2'
+  | 'gender'
+  | 'religion'
+  | 'familyLabel'
+  | 'voterSrNo'
+  | 'familyMembers'
+
+interface MemberColumnDef {
+  key: MemberColumnKey
+  label: string
+  headerClass?: string
+  sortable?: boolean
+}
+
+const MEMBER_COLUMNS: MemberColumnDef[] = [
+  { key: 'srNo', label: 'Sr No', headerClass: 'w-14', sortable: false },
+  { key: 'photo', label: 'Photo', headerClass: 'w-14', sortable: false },
+  { key: 'ward', label: 'Ward', headerClass: 'w-20', sortable: true },
+  { key: 'partNo', label: 'Part No', headerClass: 'w-20', sortable: true },
+  { key: 'section', label: 'Section', headerClass: 'w-20', sortable: true },
+  { key: 'sectionName', label: 'Section Name', headerClass: 'w-32', sortable: true },
+  { key: 'name', label: 'Name', headerClass: 'min-w-[180px]', sortable: true },
+  { key: 'status', label: 'Status', headerClass: 'w-20', sortable: false },
+  { key: 'relativeName', label: 'Relative Name', headerClass: 'min-w-[180px]', sortable: true },
+  { key: 'relation', label: 'Relation', headerClass: 'w-24', sortable: true },
+  { key: 'epicNo', label: 'EPIC', headerClass: 'w-28', sortable: true },
+  { key: 'houseNo', label: 'House No', headerClass: 'w-24', sortable: true },
+  { key: 'age', label: 'Age', headerClass: 'w-16', sortable: true },
+  { key: 'dob', label: 'Date of Birth', headerClass: 'w-28', sortable: true },
+  { key: 'contact1', label: 'Contact No 1', headerClass: 'w-32', sortable: true },
+  { key: 'contact2', label: 'Contact No 2', headerClass: 'w-32', sortable: true },
+  { key: 'gender', label: 'Gender', headerClass: 'w-20', sortable: true },
+  { key: 'religion', label: 'Religion', headerClass: 'w-24', sortable: true },
+  { key: 'familyLabel', label: 'Family Label', headerClass: 'w-28', sortable: true },
+  { key: 'voterSrNo', label: 'Voter Sr No', headerClass: 'w-20', sortable: true },
+  { key: 'familyMembers', label: 'Family Members', headerClass: 'w-24', sortable: false },
+]
+
+// Baseline pixel width per column, used to restore the default width when a
+// column is dragged back to its starting size (mirrors the headerClass widths).
+const DEFAULT_COLUMN_WIDTHS: Record<MemberColumnKey, number> = {
+  srNo: 56,
+  photo: 56,
+  ward: 80,
+  partNo: 80,
+  section: 80,
+  sectionName: 128,
+  name: 180,
+  status: 80,
+  relativeName: 180,
+  relation: 96,
+  epicNo: 112,
+  houseNo: 96,
+  age: 64,
+  dob: 112,
+  contact1: 128,
+  contact2: 128,
+  gender: 80,
+  religion: 96,
+  familyLabel: 112,
+  voterSrNo: 80,
+  familyMembers: 96,
+}
+
+const DEFAULT_VISIBLE_COLUMNS: MemberColumnKey[] = [
+  'srNo',
+  'photo',
+  'name',
+  'status',
+  'relativeName',
+  'epicNo',
+  'houseNo',
+  'partNo',
+  'section',
+  'contact1',
+  'familyMembers',
+]
+
+type PrintFieldKey =
+  | 'srNo'
+  | 'voterSrNo'
+  | 'photo'
+  | 'name'
+  | 'epicNo'
+  | 'status'
+  | 'relativeName'
+  | 'relation'
+  | 'houseNo'
+  | 'ward'
+  | 'partNo'
+  | 'section'
+  | 'sectionName'
+  | 'age'
+  | 'gender'
+  | 'contact1'
+  | 'contact2'
+  | 'religion'
+  | 'dob'
+  | 'familyLabel'
+  | 'familyMembers'
+
+interface PrintFieldDef {
+  key: PrintFieldKey
+  label: string
+  description?: string
+  isPhoto?: boolean
+  isSequentialSrNo?: boolean
+}
+
+interface PrintFieldState {
+  key: PrintFieldKey
+  enabled: boolean
+}
+
+const PRINT_FIELD_DEFS: PrintFieldDef[] = [
+  { key: 'srNo', label: 'Sr No', description: 'Sequential counter (1, 2, 3 ...)', isSequentialSrNo: true },
+  { key: 'voterSrNo', label: 'Voter Sr No', description: 'From sr_no_roll in the database' },
+  { key: 'photo', label: 'Photo', isPhoto: true },
+  { key: 'name', label: 'Name' },
+  { key: 'epicNo', label: 'EPIC' },
+  { key: 'status', label: 'Status' },
+  { key: 'relativeName', label: 'Relative Name' },
+  { key: 'relation', label: 'Relation' },
+  { key: 'houseNo', label: 'House No' },
+  { key: 'ward', label: 'Ward' },
+  { key: 'partNo', label: 'Part No' },
+  { key: 'section', label: 'Section' },
+  { key: 'sectionName', label: 'Section Name' },
+  { key: 'age', label: 'Age' },
+  { key: 'gender', label: 'Gender' },
+  { key: 'contact1', label: 'Contact No 1' },
+  { key: 'contact2', label: 'Contact No 2' },
+  { key: 'religion', label: 'Religion' },
+  { key: 'dob', label: 'Date of Birth' },
+  { key: 'familyLabel', label: 'Family Label' },
+  { key: 'familyMembers', label: 'Family Members' },
+]
+
+const DEFAULT_PRINT_FIELDS: PrintFieldState[] = [
+  { key: 'srNo', enabled: true },
+  { key: 'voterSrNo', enabled: true },
+  { key: 'photo', enabled: true },
+  { key: 'name', enabled: true },
+  { key: 'epicNo', enabled: true },
+  { key: 'status', enabled: false },
+  { key: 'relativeName', enabled: true },
+  { key: 'houseNo', enabled: true },
+  { key: 'ward', enabled: true },
+  { key: 'partNo', enabled: true },
+  { key: 'section', enabled: true },
+  { key: 'sectionName', enabled: false },
+  { key: 'age', enabled: true },
+  { key: 'contact1', enabled: true },
+  { key: 'relation', enabled: false },
+  { key: 'gender', enabled: false },
+  { key: 'contact2', enabled: false },
+  { key: 'religion', enabled: false },
+  { key: 'dob', enabled: false },
+  { key: 'familyLabel', enabled: false },
+  { key: 'familyMembers', enabled: true },
+]
+
+const PAGE_SIZE_OPTIONS = [10, 25, 50, 100]
+
+type SortDir = 'asc' | 'desc'
+
+interface FamilyGroup {
+  key: string
+  head: string
+  headVoter: Voter | null
+  members: Voter[]
+}
+
+/**
+ * Database-driven family grouping - the ONLY source of truth is
+ * `family_head_epic`. Voters sharing the same family_head_epic belong to the
+ * same family. A voter with a NULL family_head_epic is treated as a
+ * single-member family headed by itself. The family head is the voter whose
+ * epic_no equals the group's family_head_epic; if no such voter is present,
+ * the first member is shown as the display head. Mirrors FamiliesPage.
+ */
+function buildFamilies(rows: Voter[]): FamilyGroup[] {
+  const groups = new Map<string, Voter[]>()
+
+  for (const row of rows) {
+    const linkedHead = normalizeLookupValue(row.family_head_epic)
+    const key = linkedHead || normalizeLookupValue(row.epic_no)
+    const members = groups.get(key)
+    if (members) {
+      members.push(row)
+    } else {
+      groups.set(key, [row])
+    }
+  }
+
+  const families: FamilyGroup[] = Array.from(groups.entries()).map(([headEpic, members]) => {
+    const sortedMembers = [...members].sort((a, b) => {
+      const aIsHead = normalizeLookupValue(a.epic_no) === headEpic
+      const bIsHead = normalizeLookupValue(b.epic_no) === headEpic
+      if (aIsHead && !bIsHead) return -1
+      if (!aIsHead && bIsHead) return 1
+      if (a.display_order != null && b.display_order != null) return a.display_order - b.display_order
+      if (a.display_order != null) return -1
+      if (b.display_order != null) return 1
+      const aTime = a.updated_at ?? a.created_at ?? ''
+      const bTime = b.updated_at ?? b.created_at ?? ''
+      return aTime.localeCompare(bTime)
+    })
+
+    const headVoter = sortedMembers.find((member) => normalizeLookupValue(member.epic_no) === headEpic) ?? sortedMembers[0] ?? null
+
+    return {
+      key: `GROUP|${headEpic}`,
+      head: headEpic,
+      headVoter,
+      members: sortedMembers,
+    }
+  })
+
+  families.sort((a, b) => (a.headVoter?.name ?? a.head).localeCompare(b.headVoter?.name ?? b.head))
+
+  return families
+}
+
+function chunksOf<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
+  return out
+}
+
+interface AssignmentLink {
+  team_leader_id: string
+  voter_id: string
+}
+
+async function fetchAllAssignmentLinks(): Promise<{ data: AssignmentLink[]; error: string | null }> {
+  const rows: AssignmentLink[] = []
+  const pageSize = 1000
+
+  for (let offset = 0; ; offset += pageSize) {
+    const { data, error } = await supabase
+      .from('team_leader_assignments')
+      .select('team_leader_id, voter_id')
+      .range(offset, offset + pageSize - 1)
+
+    if (error) return { data: rows, error: error.message }
+
+    const page = (data as AssignmentLink[] | null) ?? []
+    rows.push(...page)
+    if (page.length < pageSize) break
+  }
+
+  return { data: rows, error: null }
+}
+
+function formatDate(value: unknown): string {
+  if (!value) return '-'
+  try {
+    const d = new Date(value as string)
+    if (Number.isNaN(d.getTime())) return '-'
+    return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+  } catch { return '-' }
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer)
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize))
+  }
+  return btoa(binary)
+}
+
+function guessImageExtension(url: string, mimeType: string): 'jpeg' | 'png' | 'gif' {
+  const fromUrl = /\.(jpe?g|png|gif|webp)(?:[?#]|$)/i.exec(url)
+  if (fromUrl) {
+    const ext = fromUrl[1].toLowerCase()
+    if (ext === 'jpg' || ext === 'webp') return 'jpeg'
+    if (ext === 'jpeg' || ext === 'png' || ext === 'gif') return ext
+  }
+  const ext = mimeType.split('/')[1]?.toLowerCase() ?? ''
+  if (ext === 'jpg' || ext === 'webp') return 'jpeg'
+  if (ext === 'jpeg' || ext === 'png' || ext === 'gif') return ext
+  return 'jpeg'
+}
+
+interface FetchedExcelImage {
+  base64: string
+  extension: 'jpeg' | 'png' | 'gif'
+  width: number
+  height: number
+}
+
+// Fetches an image for embedding in an .xlsx export and reads back its
+// intrinsic pixel dimensions so callers can scale it into a cell without
+// distorting the aspect ratio. Returns null on any failure (missing photo,
+// network error, unreadable image) so callers can skip that cell quietly.
+async function fetchImageForExcel(url: string): Promise<FetchedExcelImage | null> {
+  if (!url) return null
+  try {
+    const res = await fetch(url)
+    if (!res.ok) return null
+    const blob = await res.blob()
+    const base64 = arrayBufferToBase64(await blob.arrayBuffer())
+    const extension = guessImageExtension(url, blob.type)
+    let width = 80
+    let height = 80
+    try {
+      const bitmap = await createImageBitmap(blob)
+      width = bitmap.width
+      height = bitmap.height
+      bitmap.close?.()
+    } catch {
+      // Dimensions unavailable (e.g. unsupported format) - fall back to a
+      // square placeholder so the image still renders at a sane size.
+    }
+    return { base64, extension, width, height }
+  } catch {
+    return null
+  }
+}
+
+function vf(v: Voter, field: string): string {
+  const value = (v as unknown as Record<string, unknown>)[field]
+  return value === null || value === undefined ? '' : String(value)
+}
+
+function vfNum(v: Voter, field: string): number | null {
+  const value = (v as unknown as Record<string, unknown>)[field]
+  if (value === null || value === undefined) return null
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+// Resolve the best contact number for a voter. Falls back to a family member's
+// number (head first, then by family display order) when the voter's own
+// numbers are empty. Returns the number and the name of its owner.
+function resolveContact(voter: Voter, family?: FamilyGroup): { number: string; ownerName: string } {
+  const own = vf(voter, 'contact_no_1') || vf(voter, 'contact_no_2')
+  if (own) return { number: own, ownerName: vf(voter, 'name') || '' }
+  if (family) {
+    for (const member of family.members) {
+      if (member.id === voter.id) continue
+      const num = vf(member, 'contact_no_1') || vf(member, 'contact_no_2')
+      if (num) return { number: num, ownerName: vf(member, 'name') || '' }
+    }
+  }
+  return { number: '', ownerName: '' }
+}
+
+function getVoterFieldValue(v: Voter, key: MemberColumnKey, family?: FamilyGroup): string {
+  switch (key) {
+    case 'srNo': return ''
+    case 'photo': return ''
+    case 'ward': { const n = vfNum(v, 'ward_no'); return n != null ? String(n) : '-' }
+    case 'partNo': { const n = vfNum(v, 'part_no'); return n != null ? String(n) : '-' }
+    case 'section': return vf(v, 'section') || '-'
+    case 'sectionName': return vf(v, 'section_name') || '-'
+    case 'name': return vf(v, 'name') || '-'
+    case 'status': return ''
+    case 'relativeName': return vf(v, 'relative_name') || '-'
+    case 'relation': return vf(v, 'relative_relation') || '-'
+    case 'epicNo': return vf(v, 'epic_no') || '-'
+    case 'houseNo': return vf(v, 'house_no') || '-'
+    case 'age': { const n = vfNum(v, 'age'); return n != null ? String(n) : '-' }
+    case 'dob': return formatDate(vf(v, 'date_of_birth')) || '-'
+    case 'contact1': { const contact = resolveContact(v, family); return contact.number || '-' }
+    case 'contact2': return vf(v, 'contact_no_2') || '-'
+    case 'gender': return vf(v, 'gender') || '-'
+    case 'religion': return vf(v, 'religion') || '-'
+    case 'familyLabel': return vf(v, 'family_label') || family?.headVoter?.family_label || '-'
+    case 'voterSrNo': return vf(v, 'sr_no_roll') || '-'
+    case 'familyMembers': return family ? String(family.members.length) : ''
+    default: return '-'
+  }
+}
+
+function getPrintFieldValue(v: Voter, key: PrintFieldKey, family?: FamilyGroup, photoUrl?: string): string {
+  switch (key) {
+    case 'voterSrNo': return vf(v, 'sr_no_roll') || '-'
+    case 'photo': return photoUrl ?? ''
+    case 'name': return vf(v, 'name') || '-'
+    case 'epicNo': return vf(v, 'epic_no') || '-'
+    case 'status': return ''
+    case 'relativeName': return vf(v, 'relative_name') || '-'
+    case 'relation': return vf(v, 'relative_relation') || '-'
+    case 'houseNo': return vf(v, 'house_no') || '-'
+    case 'ward': { const n = vfNum(v, 'ward_no'); return n != null ? String(n) : '-' }
+    case 'partNo': { const n = vfNum(v, 'part_no'); return n != null ? String(n) : '-' }
+    case 'section': return vf(v, 'section') || '-'
+    case 'sectionName': return vf(v, 'section_name') || '-'
+    case 'age': { const n = vfNum(v, 'age'); return n != null ? String(n) : '-' }
+    case 'gender': return vf(v, 'gender') || '-'
+    case 'contact1': { const contact = resolveContact(v, family); return contact.number || '-' }
+    case 'contact2': return vf(v, 'contact_no_2') || '-'
+    case 'religion': return vf(v, 'religion') || '-'
+    case 'dob': return formatDate(vf(v, 'date_of_birth')) || '-'
+    case 'familyLabel': return vf(v, 'family_label') || family?.headVoter?.family_label || '-'
+    case 'familyMembers': return family ? String(family.members.length) : ''
+    case 'srNo': return ''
+    default: return '-'
+  }
+}
+
+function getPrintColumnStyle(key: PrintFieldKey): string {
+  switch (key) {
+    case 'srNo': return 'width:46px;text-align:center;white-space:nowrap'
+    case 'voterSrNo': return 'width:64px;text-align:center;white-space:nowrap'
+    case 'photo': return 'width:64px;text-align:center;white-space:nowrap'
+    case 'name': return 'min-width:130px'
+    case 'epicNo': return 'width:90px;white-space:nowrap'
+    case 'status': return 'width:60px;white-space:nowrap'
+    case 'relativeName': return 'min-width:130px'
+    case 'houseNo': return 'width:60px;text-align:center;white-space:nowrap'
+    case 'ward': return 'width:50px;text-align:center;white-space:nowrap'
+    case 'partNo': return 'width:54px;text-align:center;white-space:nowrap'
+    case 'section': return 'width:60px;white-space:nowrap'
+    case 'sectionName': return 'width:100px;white-space:nowrap'
+    case 'age': return 'width:44px;text-align:center;white-space:nowrap'
+    case 'gender': return 'width:60px;white-space:nowrap'
+    case 'contact1': return 'width:90px;white-space:nowrap'
+    case 'contact2': return 'width:90px;white-space:nowrap'
+    case 'religion': return 'width:80px;white-space:nowrap'
+    case 'dob': return 'width:88px;white-space:nowrap'
+    case 'familyLabel': return 'width:90px;white-space:nowrap'
+    case 'relation': return 'width:72px;white-space:nowrap'
+    case 'familyMembers': return 'width:60px;text-align:center;white-space:nowrap'
+    default: return ''
+  }
+}
+
+// Override the baseline printed column style with a persisted custom width.
+// Used to feed the same drag-resized column widths into the printed HTML.
+function getPrintColumnStyleWithWidths(key: PrintFieldKey, widths: Partial<Record<MemberColumnKey, number>>): string {
+  const base = getPrintColumnStyle(key)
+  const width = widths[key]
+  if (width == null) return base
+  const withoutWidth = base
+    .replace(/min-width:\d+px/, '')
+    .replace(/width:\d+px/, '')
+    .replace(/;;+/g, ';')
+    .replace(/^;/, '')
+    .replace(/;$/, '')
+  const suffix = withoutWidth ? `${withoutWidth};width:${width}px` : `width:${width}px`
+  return suffix
+}
+
+// Slim drag handle on the right edge of a table header that lets the user
+// resize the column. The width is applied live to the <th> during the drag
+// and committed to the parent via onResize on release.
+function ColumnResizeHandle({ columnKey, onResize }: {
+  columnKey: MemberColumnKey
+  onResize: (key: MemberColumnKey, width: number) => void
+}) {
+  const startDrag = (event: React.MouseEvent) => {
+    event.preventDefault()
+    event.stopPropagation()
+    const th = (event.currentTarget as HTMLElement).closest('th') as HTMLElement | null
+    if (!th) return
+    const startX = event.clientX
+    const startWidth = th.getBoundingClientRect().width
+    const onMove = (ev: MouseEvent) => {
+      const next = Math.max(COLUMN_RESIZE_MIN_WIDTH, Math.round(startWidth + ev.clientX - startX))
+      th.style.width = `${next}px`
+    }
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.style.cursor = ''
+      onResize(columnKey, Math.round(th.getBoundingClientRect().width))
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+    document.body.style.cursor = 'col-resize'
+  }
+
+  return (
+    <span
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={`Resize ${columnKey} column`}
+      onMouseDown={startDrag}
+      className="absolute right-0 top-0 flex h-full w-3.5 cursor-col-resize items-center justify-center text-slate-300 opacity-0 transition hover:bg-brand-100/60 hover:text-brand-500 group-hover:opacity-100"
+    >
+      <GripVertical className="h-3.5 w-3.5" />
+    </span>
+  )
+}
+
+function voterSearchText(v: Voter): string {
+  return [
+    vf(v, 'name'), vf(v, 'epic_no'), vf(v, 'relative_name'), vf(v, 'relative_relation'),
+    vf(v, 'contact_no_1'), vf(v, 'contact_no_2'), vf(v, 'section'), vf(v, 'section_name'), vf(v, 'house_no'),
+    vf(v, 'gender'), vf(v, 'religion'), vf(v, 'family_label'),
+    String(vfNum(v, 'ward_no') ?? ''), String(vfNum(v, 'part_no') ?? ''), String(vfNum(v, 'age') ?? ''),
+  ].join(' ').toUpperCase()
+}
+
+function buildFamilyHeadEpic(voter: Voter): string {
+  if (voter.family_head_epic) return normalizeLookupValue(voter.family_head_epic)
+  return normalizeLookupValue(voter.epic_no)
+}
+
+function CheckboxUI({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button
+      type="button"
+      onClick={(e) => { e.stopPropagation(); onChange(!checked) }}
+      className={`flex h-5 w-5 flex-shrink-0 items-center justify-center rounded border transition ${
+        checked
+          ? 'border-brand-500 bg-brand-500 text-white'
+          : 'border-slate-300 bg-white hover:border-brand-400'
+      }`}
+      aria-checked={checked}
+      role="checkbox"
+    >
+      {checked && <Check className="h-3.5 w-3.5" strokeWidth={3} />}
+    </button>
+  )
+}
+
+function VoterAvatar({ voter, photoUrl, size = 'md' }: { voter: Voter; photoUrl?: string; size?: 'sm' | 'md' }) {
+  const dim = size === 'sm' ? 'h-7 w-7 text-[9px]' : 'h-9 w-9 text-[10px]'
+  if (photoUrl) {
+    return <img src={photoUrl} alt={vf(voter, 'name')} className={`${dim} flex-shrink-0 rounded-full border border-slate-200 object-cover`} />
+  }
+  return (
+    <span className={`${dim} inline-flex flex-shrink-0 items-center justify-center rounded-full bg-brand-100 font-semibold text-brand-700`}>
+      {initials(vf(voter, 'name'))}
+    </span>
+  )
+}
+
+function IconButton({ onClick, title, variant = 'default', children, disabled }: {
+  onClick: (e?: React.MouseEvent) => void; title: string; variant?: 'default' | 'danger' | 'primary'; children: React.ReactNode; disabled?: boolean
+}) {
+  const base = 'inline-flex h-9 w-9 items-center justify-center rounded-xl border transition disabled:cursor-not-allowed disabled:opacity-50'
+  const styles =
+    variant === 'danger' ? 'border-rose-200 bg-rose-50 text-rose-600 hover:bg-rose-100'
+    : variant === 'primary' ? 'border-brand-200 bg-brand-50 text-brand-700 hover:bg-brand-100'
+    : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-100'
+  return <button type="button" title={title} onClick={onClick} disabled={disabled} className={`${base} ${styles}`}>{children}</button>
+}
+
+function MoreMenu({ children }: { children: (close: () => void) => React.ReactNode }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false) }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  return (
+    <div ref={ref} className="relative" onClick={(e) => e.stopPropagation()}>
+      <button
+        type="button"
+        title="More actions"
+        aria-label="More actions"
+        onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }}
+        className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-400 opacity-0 transition group-hover:opacity-100 hover:bg-slate-100 hover:text-slate-700 focus:opacity-100"
+      >
+        <MoreHorizontal className="h-4 w-4" />
+      </button>
+      {open && (
+        <div className="absolute right-0 z-30 mt-1 w-48 rounded-xl border border-slate-200 bg-white p-1.5 shadow-lg">
+          {children(() => setOpen(false))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ColumnsDropdown({ visible, onChange }: { visible: MemberColumnKey[]; onChange: (next: MemberColumnKey[]) => void }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false) }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  const visibleSet = new Set(visible)
+
+  const toggle = (key: MemberColumnKey) => {
+    const next = new Set(visibleSet)
+    if (next.has(key)) {
+      if (next.size <= 1) { toast.error('At least one column must remain visible.'); return }
+      next.delete(key)
+    } else { next.add(key) }
+    onChange(MEMBER_COLUMNS.map((c) => c.key).filter((k) => next.has(k)))
+  }
+
+  return (
+    <div ref={ref} className="relative">
+      <button type="button" onClick={() => setOpen((v) => !v)} className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-100">
+        <Columns3 className="h-3.5 w-3.5" /> Display Columns
+      </button>
+      {open && (
+        <div className="absolute right-0 z-30 mt-2 w-72 rounded-2xl border border-slate-200 bg-white p-4 shadow-soft">
+          <p className="mb-3 text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Show / Hide Columns</p>
+          <div className="max-h-[60vh] space-y-0.5 overflow-y-auto">
+            {MEMBER_COLUMNS.map((col) => {
+              const checked = visibleSet.has(col.key)
+              return (
+                <label key={col.key} className={`flex cursor-pointer items-center gap-2 rounded-xl px-3 py-2 text-sm transition ${checked ? 'bg-brand-50 text-brand-800' : 'text-slate-700 hover:bg-slate-50'}`}>
+                  <CheckboxUI checked={checked} onChange={() => toggle(col.key)} />
+                  <span>{col.label}</span>
+                </label>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+interface LeaderOption {
+  id: string
+  name: string
+  epicNo: string
+  part_no: number | null
+  section: number | null
+}
+
+function TransferFamiliesModal({
+  open,
+  currentLeaderId,
+  families,
+  assignedIds,
+  transferring,
+  resolvePhotoUrl,
+  onClose,
+  onConfirm,
+}: {
+  open: boolean
+  currentLeaderId: string | undefined
+  families: FamilyGroup[]
+  assignedIds: Set<string>
+  transferring: boolean
+  resolvePhotoUrl: (voter: Voter | null | undefined) => string
+  onClose: () => void
+  onConfirm: (familiesToTransfer: FamilyGroup[], targetLeaderId: string) => void
+}) {
+  const [leaders, setLeaders] = useState<LeaderOption[]>([])
+  const [loadingLeaders, setLoadingLeaders] = useState(false)
+  const [targetLeaderId, setTargetLeaderId] = useState('')
+  const [selectedFamilyKeys, setSelectedFamilyKeys] = useState<Set<string>>(new Set())
+  const [filter, setFilter] = useState('')
+  const [scopeFilter, setScopeFilter] = useState<'all' | 'voters' | 'heads'>('all')
+  const [leaderSearch, setLeaderSearch] = useState('')
+  const [partFilter, setPartFilter] = useState('')
+
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    setTargetLeaderId('')
+    setSelectedFamilyKeys(new Set())
+    setFilter('')
+    setScopeFilter('all')
+    setLeaderSearch('')
+    setPartFilter('')
+    setLoadingLeaders(true)
+    const run = async () => {
+      const { data: tls } = await supabase
+        .from('team_leaders')
+        .select('id, voter_id, part_no, section, notes')
+        .order('created_at', { ascending: false })
+      if (cancelled) return
+      const all = (tls as Array<{ id: string; voter_id: string; part_no: number | null; section: number | null; notes: string | null }> | null) ?? []
+      const others = all.filter((tl) => tl.id !== currentLeaderId)
+
+      const voterIds = Array.from(new Set(others.map((tl) => tl.voter_id).filter(Boolean)))
+      const voters: Voter[] = []
+      if (voterIds.length) {
+        const results = await Promise.all(
+          chunksOf(voterIds, 150).map((chunk) => supabase.from('voters').select('id, epic_no, name').in('id', chunk)),
+        )
+        for (const r of results) {
+          if (r.error) { toast.error(r.error.message); continue }
+          voters.push(...((r.data as Voter[] | null) ?? []))
+        }
+      }
+      const byId = new Map(voters.map((v) => [v.id, v]))
+      const options: LeaderOption[] = others.map((tl) => {
+        if (isOfficeLeader(tl)) {
+          return { id: tl.id, name: 'Office', epicNo: '', part_no: tl.part_no, section: tl.section }
+        }
+        if (isShiftedLeader(tl)) {
+          return { id: tl.id, name: 'Shifted', epicNo: '', part_no: tl.part_no, section: tl.section }
+        }
+        const v = byId.get(tl.voter_id)
+        return { id: tl.id, name: v?.name ?? 'Unknown leader', epicNo: v?.epic_no ?? '', part_no: tl.part_no, section: tl.section }
+      })
+      if (cancelled) return
+      setLeaders([...options].sort((a, b) => a.name.localeCompare(b.name)))
+      setLoadingLeaders(false)
+    }
+    void run()
+    return () => { cancelled = true }
+  }, [open, currentLeaderId])
+
+  const partOptions = useMemo(() => {
+    const parts = new Set(leaders.map((tl) => tl.part_no).filter((p): p is number => p !== null && p !== undefined))
+    return Array.from(parts).sort((a, b) => a - b)
+  }, [leaders])
+
+  const filteredLeaders = useMemo(() => {
+    const tokens = tokenizeLookup(leaderSearch)
+    return leaders.filter((tl) => {
+      if (partFilter) {
+        if (tl.part_no == null || String(tl.part_no) !== partFilter) return false
+      }
+      if (!tokens.length) return true
+      const lookupText = normalizeLookupValue(
+        `${tl.name} ${tl.epicNo} ${tl.part_no ?? ''} ${tl.section ?? ''}`,
+      )
+      return matchesLookupTokens(lookupText, tokens)
+    })
+  }, [leaders, leaderSearch, partFilter])
+
+  const filteredFamilies = useMemo(() => {
+    const tokens = tokenizeLookup(filter)
+    return families.filter((f) => {
+      if (scopeFilter === 'voters') {
+        const moving = f.members.some((m) => assignedIds.has(m.id))
+        if (!moving) return false
+      } else if (scopeFilter === 'heads') {
+        const head = f.headVoter ?? f.members[0]
+        if (!head || !assignedIds.has(head.id)) return false
+      }
+      if (!tokens.length) return true
+      const head = f.headVoter ?? f.members[0]
+      const lookupText = normalizeLookupValue(`${head?.name ?? ''} ${head?.epic_no ?? ''} ${f.head ?? ''}`)
+      return matchesLookupTokens(lookupText, tokens)
+    })
+  }, [families, filter, scopeFilter, assignedIds])
+
+  const toggleFamily = (key: string) => {
+    setSelectedFamilyKeys((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  const allFilteredSelected = filteredFamilies.length > 0 && filteredFamilies.every((f) => selectedFamilyKeys.has(f.key))
+
+  const selectedFamilies = filteredFamilies.filter((f) => selectedFamilyKeys.has(f.key))
+  const canConfirm = targetLeaderId !== '' && selectedFamilies.length > 0 && !transferring
+
+  if (!open) return null
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm">
+      <div className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-3xl bg-white shadow-2xl">
+        <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-6 py-5">
+          <div>
+            <h3 className="text-lg font-semibold text-slate-900">Transfer Families</h3>
+            <p className="mt-1 text-xs text-slate-500">
+              Move selected families to another team leader. Direct-voter status is preserved.
+            </p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600" aria-label="Close"><X className="h-5 w-5" /></button>
+        </div>
+
+        <div className="space-y-4 border-b border-slate-200 px-6 py-4">
+          <div>
+            <label className="mb-1 block text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Transfer to Team Leader</label>
+            {loadingLeaders ? (
+              <div className="flex h-10 items-center gap-2 text-sm text-slate-500"><Loader2 className="h-4 w-4 animate-spin" /> Loading team leaders...</div>
+            ) : leaders.length === 0 ? (
+              <p className="text-sm text-slate-500">No other team leaders available to transfer to.</p>
+            ) : (
+              <div className="flex items-center gap-2">
+                <select
+                  value={targetLeaderId}
+                  onChange={(e) => setTargetLeaderId(e.target.value)}
+                  className="h-10 flex-1 rounded-xl border border-slate-200 bg-white px-3 text-sm outline-none focus:border-brand-300 focus:ring-2 focus:ring-brand-100"
+                >
+                  <option value="">Select a team leader...</option>
+                  {filteredLeaders.map((tl) => (
+                    <option key={tl.id} value={tl.id}>
+                      {tl.name}{tl.epicNo ? ` (${tl.epicNo})` : ''}{tl.part_no != null ? ` · Part ${tl.part_no}` : ''}{tl.section != null ? ` / Sec ${tl.section}` : ''}
+                    </option>
+                  ))}
+                </select>
+                <div className="relative flex-shrink-0">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                  <input
+                    className="h-10 w-44 rounded-xl border border-slate-200 bg-white pl-8 pr-2 text-xs outline-none transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100"
+                    placeholder="Search leaders..."
+                    value={leaderSearch}
+                    onChange={(e) => setLeaderSearch(e.target.value)}
+                  />
+                </div>
+                <select
+                  value={partFilter}
+                  onChange={(e) => setPartFilter(e.target.value)}
+                  className="h-10 flex-shrink-0 rounded-xl border border-slate-200 bg-white px-2.5 text-xs outline-none transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100"
+                >
+                  <option value="">All Parts</option>
+                  {partOptions.map((part) => (
+                    <option key={part} value={String(part)}>Part {part}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </div>
+
+          <div>
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <label className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Families to Transfer</label>
+              <div className="flex items-center gap-2">
+                <div className="flex items-center rounded-lg border border-slate-200 p-0.5">
+                  {(['all', 'voters', 'heads'] as const).map((scope) => (
+                    <button
+                      key={scope}
+                      type="button"
+                      onClick={() => setScopeFilter(scope)}
+                      className={`h-7 rounded-md px-2.5 text-[11px] font-semibold transition ${
+                        scopeFilter === scope
+                          ? 'bg-slate-900 text-white'
+                          : 'text-slate-500 hover:text-slate-800'
+                      }`}
+                    >
+                      {scope === 'all' ? 'All' : scope === 'voters' ? 'Voters Only' : 'Family Heads'}
+                    </button>
+                  ))}
+                </div>
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                  <input
+                    className="h-8 w-44 rounded-lg border border-slate-200 bg-white pl-8 pr-2 text-xs outline-none transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100"
+                    placeholder="Filter families..."
+                    value={filter}
+                    onChange={(e) => setFilter(e.target.value)}
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedFamilyKeys(allFilteredSelected ? new Set() : new Set(filteredFamilies.map((f) => f.key)))}
+                  className="inline-flex h-8 items-center rounded-lg border border-slate-200 bg-white px-2.5 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-100"
+                >
+                  {allFilteredSelected ? 'Clear Selection' : 'Select All'}
+                </button>
+              </div>
+            </div>
+            <div className="max-h-[38vh] space-y-2 overflow-y-auto rounded-2xl border border-slate-200 p-3">
+              {filteredFamilies.length === 0 ? (
+                <p className="py-8 text-center text-sm text-slate-500">No families found.</p>
+              ) : (
+                filteredFamilies.map((family) => {
+                  const head = family.headVoter ?? family.members[0] ?? null
+                  const selected = selectedFamilyKeys.has(family.key)
+                  const movingCount = family.members.filter((m) => assignedIds.has(m.id)).length
+                  return (
+                    <div key={family.key} className={`flex items-center gap-3 rounded-xl border p-3 transition ${selected ? 'border-brand-400 bg-brand-50/60 ring-2 ring-brand-100' : 'border-slate-200'}`}>
+                      <CheckboxUI checked={selected} onChange={() => toggleFamily(family.key)} />
+                      <VoterAvatar voter={head} photoUrl={resolvePhotoUrl(head)} size="sm" />
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-semibold text-slate-900">{head?.name ?? 'Unknown head'}</p>
+                        <p className="truncate text-xs text-slate-500">
+                          {head?.epic_no ? `EPIC: ${head.epic_no} · ` : ''}{family.members.length} member{family.members.length === 1 ? '' : 's'}
+                        </p>
+                      </div>
+                      <span className="inline-flex flex-shrink-0 items-center rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-700">
+                        {movingCount} moving
+                      </span>
+                    </div>
+                  )
+                })
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-between gap-3 px-6 py-4">
+          <span className="text-xs text-slate-500">
+            {selectedFamilies.length} famil{selectedFamilies.length === 1 ? 'y' : 'ies'} selected
+          </span>
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={onClose} className="h-10 rounded-xl border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-600 transition hover:bg-slate-100">Cancel</button>
+            <button
+              type="button"
+              disabled={!canConfirm}
+              onClick={() => onConfirm(selectedFamilies, targetLeaderId)}
+              className="inline-flex h-10 items-center gap-1.5 rounded-xl bg-slate-900 px-5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {transferring ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowLeftRight className="h-4 w-4" />} Transfer
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ChangeLeaderModal({
+  open,
+  currentLeader,
+  hasWardRestriction,
+  allowedWards,
+  saving,
+  onClose,
+  onConfirm,
+}: {
+  open: boolean
+  currentLeader: TeamLeader | null
+  hasWardRestriction: boolean
+  allowedWards: number[]
+  saving: boolean
+  onClose: () => void
+  onConfirm: (newLeader: Voter, partNo: string, section: string) => void
+}) {
+  const [voterQuery, setVoterQuery] = useState('')
+  const [searching, setSearching] = useState(false)
+  const [searchResults, setSearchResults] = useState<Voter[]>([])
+  const [showDropdown, setShowDropdown] = useState(false)
+  const [selectedVoter, setSelectedVoter] = useState<Voter | null>(null)
+  const [partNo, setPartNo] = useState('')
+  const [section, setSection] = useState('')
+  const [otherLeaderVoterIds, setOtherLeaderVoterIds] = useState<Set<string>>(new Set())
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    setVoterQuery('')
+    setSearchResults([])
+    setSearching(false)
+    setShowDropdown(false)
+    setSelectedVoter(null)
+    setPartNo(currentLeader?.part_no != null ? String(currentLeader.part_no) : '')
+    setSection(currentLeader?.section != null ? String(currentLeader.section) : '')
+    const run = async () => {
+      const { data: tls } = await supabase.from('team_leaders').select('id, voter_id')
+      if (cancelled) return
+      const ids = new Set<string>()
+      for (const tl of (tls as Array<{ id: string; voter_id: string }> | null) ?? []) {
+        if (tl.id !== currentLeader?.id && tl.voter_id) ids.add(tl.voter_id)
+      }
+      setOtherLeaderVoterIds(ids)
+    }
+    void run()
+    return () => { cancelled = true }
+  }, [open, currentLeader])
+
+  useEffect(() => {
+    if (!voterQuery.trim()) { setSearchResults([]); setSearching(false); return }
+    let cancelled = false
+    const run = async () => {
+      setSearching(true)
+      const trimmed = voterQuery.trim()
+      const searchTokens = tokenizeLookup(trimmed)
+
+      if (searchTokens.length === 1 && isLikelyEpicToken(searchTokens[0])) {
+        const epicToken = compactLookupValue(searchTokens[0])
+        let exactReq = supabase.from('voters').select('*').eq('epic_no', epicToken)
+        if (hasWardRestriction) exactReq = exactReq.in('ward_no', allowedWards)
+        const { data: exactRow } = await exactReq.maybeSingle()
+        if (cancelled) return
+        setSearchResults(exactRow ? [exactRow as Voter] : [])
+        setSearching(false)
+        return
+      }
+
+      const sp = `%${escapeIlikePattern(trimmed).replace(/\s+/g, '%')}%`
+      let req = supabase.from('voters').select('*').or([`name.ilike.${sp}`,`relative_name.ilike.${sp}`,`epic_no.ilike.${sp}`,`contact_no_1.ilike.${sp}`,`house_no.ilike.${sp}`].join(',')).limit(20)
+      if (hasWardRestriction) req = req.in('ward_no', allowedWards)
+      const { data: matches } = await req
+      if (cancelled) return
+      setSearchResults((matches as Voter[] | null) ?? [])
+      setSearching(false)
+    }
+    void run()
+    return () => { cancelled = true }
+  }, [voterQuery, hasWardRestriction, allowedWards])
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => { if (containerRef.current && !containerRef.current.contains(e.target as Node)) setShowDropdown(false) }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  const selectVoter = (v: Voter) => {
+    if (v.id === currentLeader?.voter_id) {
+      toast.error('This voter is already the current team leader.')
+      return
+    }
+    if (otherLeaderVoterIds.has(v.id)) {
+      toast.error('This voter is already a team leader.')
+      return
+    }
+    setSelectedVoter(v)
+    setPartNo(v.part_no != null ? String(v.part_no) : '')
+    setSection(v.section != null ? String(v.section) : '')
+    setVoterQuery('')
+    setSearchResults([])
+    setShowDropdown(false)
+  }
+
+  const tokens = useMemo(() => tokenizeLookup(voterQuery), [voterQuery])
+
+  const confirm = () => {
+    if (!selectedVoter) { toast.error('Select a voter first.'); return }
+    onConfirm(selectedVoter, partNo, section)
+  }
+
+  if (!open) return null
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm">
+      <div className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-3xl bg-white shadow-2xl">
+        <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-6 py-5">
+          <div>
+            <h3 className="text-lg font-semibold text-slate-900">Change Team Leader</h3>
+            <p className="mt-1 text-xs text-slate-500">
+              Replace the person leading this team. Assigned voters stay untouched - only the leader itself changes.
+            </p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600" aria-label="Close"><X className="h-5 w-5" /></button>
+        </div>
+
+        <div className="space-y-4 px-6 py-4">
+          <div>
+            <label className="mb-1 block text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">New Team Leader Voter</label>
+            <div ref={containerRef} className="relative">
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <input
+                  className="h-11 w-full rounded-xl border border-slate-200 bg-white pl-10 pr-10 text-sm outline-none transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100"
+                  placeholder="Search by name, EPIC, relative name, mobile, house number..."
+                  value={voterQuery}
+                  onChange={(e) => { setVoterQuery(e.target.value); if (!showDropdown) setShowDropdown(true) }}
+                  onFocus={() => { if (voterQuery.trim()) setShowDropdown(true) }}
+                />
+                {voterQuery && (
+                  <button type="button" onClick={() => { setVoterQuery(''); setSearchResults([]) }}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600" aria-label="Clear search">
+                    <X className="h-4 w-4" />
+                  </button>
+                )}
+              </div>
+
+              {showDropdown && voterQuery.trim() && searching && (
+                <div className="absolute z-20 mt-2 w-full rounded-2xl border border-slate-200 bg-white p-4 shadow-soft">
+                  <div className="flex items-center justify-center gap-2 text-sm text-slate-500"><Loader2 className="h-4 w-4 animate-spin" /> Searching...</div>
+                </div>
+              )}
+
+              {showDropdown && voterQuery.trim() && !searching && searchResults.length > 0 && (
+                <div className="absolute z-20 mt-2 w-full max-h-[50vh] overflow-y-auto rounded-2xl border border-slate-200 bg-white p-3 shadow-soft">
+                  <div className="space-y-1.5">
+                    {searchResults.map((v) => {
+                      const isCurrent = v.id === currentLeader?.voter_id
+                      const alreadyLeader = otherLeaderVoterIds.has(v.id)
+                      const blocked = isCurrent || alreadyLeader
+                      return (
+                        <button
+                          key={v.id}
+                          type="button"
+                          disabled={blocked}
+                          onClick={() => selectVoter(v)}
+                          className={`flex w-full items-center gap-3 rounded-xl border p-3 text-left transition ${blocked ? 'cursor-not-allowed opacity-50' : 'border-slate-200 hover:border-brand-300 hover:bg-brand-50/40'}`}
+                        >
+                          <VoterAvatar voter={v} />
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate text-sm font-medium text-slate-900">
+                              {highlightMatch(v.name, tokens)}
+                              {isCurrent && <span className="ml-2 inline-flex rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">Current Leader</span>}
+                              {alreadyLeader && <span className="ml-2 inline-flex rounded-full bg-brand-50 px-2 py-0.5 text-[10px] font-semibold text-brand-700">Already Leader</span>}
+                            </p>
+                            <p className="truncate text-xs text-slate-500">
+                              EPIC: {highlightMatch(v.epic_no, tokens)}{v.part_no != null ? ` · Part ${v.part_no}` : ''}{v.section != null ? ` / Sec ${v.section}` : ''}
+                            </p>
+                          </div>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {showDropdown && voterQuery.trim() && !searching && searchResults.length === 0 && (
+                <div className="absolute z-20 mt-2 w-full rounded-2xl border border-slate-200 bg-white p-4 text-center text-sm text-slate-500 shadow-soft">
+                  No voters found.
+                </div>
+              )}
+            </div>
+          </div>
+
+          {selectedVoter && (
+            <div className="rounded-2xl border border-slate-200 bg-slate-50/50 p-4">
+              <div className="flex flex-wrap items-start gap-4">
+                <VoterAvatar voter={selectedVoter} />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold text-slate-900">{selectedVoter.name}</p>
+                  <p className="text-xs text-slate-500">
+                    EPIC: {selectedVoter.epic_no}{selectedVoter.part_no != null ? ` Part: ${selectedVoter.part_no}` : ''}{selectedVoter.section != null ? ` Section: ${selectedVoter.section}` : ''}
+                  </p>
+                </div>
+                <button type="button" onClick={() => setSelectedVoter(null)}
+                  className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600" aria-label="Clear selection">
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+                <div>
+                  <label className="mb-1 block text-xs font-semibold uppercase tracking-wider text-slate-500">Part No</label>
+                  <input
+                    className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm outline-none transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100"
+                    value={partNo}
+                    onChange={(e) => setPartNo(e.target.value.replace(/[^0-9]/g, ''))}
+                    placeholder="e.g. 5"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-semibold uppercase tracking-wider text-slate-500">Section</label>
+                  <input
+                    className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm outline-none transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100"
+                    value={section}
+                    onChange={(e) => setSection(e.target.value.replace(/[^0-9]/g, ''))}
+                    placeholder="e.g. 2"
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center justify-between gap-3 border-t border-slate-200 px-6 py-4">
+          <span className="text-xs text-slate-500">
+            {selectedVoter ? `Change leader to ${selectedVoter.name}` : 'Select a voter to become the new leader.'}
+          </span>
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={onClose} className="h-10 rounded-xl border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-600 transition hover:bg-slate-100">Cancel</button>
+            <button
+              type="button"
+              disabled={!selectedVoter || saving}
+              onClick={confirm}
+              className="inline-flex h-10 items-center gap-1.5 rounded-xl bg-slate-900 px-5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <UserCog className="h-4 w-4" />} Change Leader
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── RemoveAssignmentModal ──────────────────────────────────────────────
+
+function RemoveAssignmentModal({ voter, voterCount, onClose, onConfirm }: {
+  voter: Voter | null
+  voterCount: number
+  onClose: () => void
+  onConfirm: () => Promise<void>
+}) {
+  const [confirmName, setConfirmName] = useState('')
+  const [removing, setRemoving] = useState(false)
+  useEffect(() => { setConfirmName('') }, [voter])
+  if (!voter) return null
+
+  const voterName = voter.name ?? ''
+  const matches = confirmName.trim().toLowerCase() === voterName.trim().toLowerCase()
+
+  const confirm = async () => {
+    if (!matches || removing) return
+    setRemoving(true)
+    await onConfirm()
+    setRemoving(false)
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm">
+      <div className="w-full max-w-md rounded-3xl bg-white p-6 shadow-2xl">
+        <div className="mb-4 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-rose-50 text-rose-600">
+              <Trash2 className="h-4 w-4" />
+            </span>
+            <h3 className="text-lg font-semibold text-slate-900">Remove assignment</h3>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600" aria-label="Close"><X className="h-5 w-5" /></button>
+        </div>
+        <p className="text-sm leading-6 text-slate-600">
+          This unlinks <span className="font-semibold text-slate-900">&ldquo;{voterName}&rdquo;</span>
+          {voterCount > 1 && <span> and their family ({voterCount} voters)</span>} from this team leader&rsquo;s assigned voters. This cannot be undone. To confirm, type the voter&rsquo;s name below.
+        </p>
+        <label className="mt-4 block text-sm text-slate-600">
+          Type <span className="font-semibold text-slate-900">&ldquo;{voterName}&rdquo;</span> to confirm
+          <input autoFocus className="mt-1 h-11 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm outline-none transition focus:border-rose-400 focus:ring-2 focus:ring-rose-100"
+            value={confirmName} onChange={(e) => setConfirmName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void confirm() }} />
+        </label>
+        <div className="mt-6 flex justify-end gap-2">
+          <button type="button" onClick={onClose} className="h-10 rounded-xl border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-700 transition hover:bg-slate-100">Cancel</button>
+          <button type="button" disabled={!matches || removing} onClick={() => void confirm()}
+            className="inline-flex h-10 items-center gap-2 rounded-xl bg-rose-600 px-5 text-sm font-semibold text-white transition hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-50">
+            {removing && <Loader2 className="h-4 w-4 animate-spin" />} Remove assignment
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── ChangePrimaryVoterModal ─────────────────────────────────────────────
+
+function ChangePrimaryVoterModal({ open, family, assignedIds, directVoterIds, saving, resolvePhotoUrl, onClose, onConfirm }: {
+  open: boolean
+  family: FamilyGroup | null
+  assignedIds: Set<string>
+  directVoterIds: Set<string>
+  saving: boolean
+  resolvePhotoUrl: (voter: Voter | null | undefined) => string
+  onClose: () => void
+  onConfirm: (family: FamilyGroup, memberId: string) => void
+}) {
+  const members = family ? family.members.filter((m) => assignedIds.has(m.id)) : []
+  const currentId = family
+    ? family.members.find((m) => assignedIds.has(m.id) && directVoterIds.has(m.id))?.id
+    : ''
+  const [selectedId, setSelectedId] = useState<string>('')
+
+  useEffect(() => {
+    if (family) setSelectedId(currentId ?? members[0]?.id ?? '')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [family])
+
+  if (!open || !family) return null
+
+  const canConfirm = selectedId !== '' && selectedId !== currentId && !saving
+
+  const confirm = () => {
+    if (!selectedId) return
+    onConfirm(family, selectedId)
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm">
+      <div className="flex max-h-[90vh] w-full max-w-lg flex-col overflow-hidden rounded-3xl bg-white shadow-2xl">
+        <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-6 py-5">
+          <div>
+            <h3 className="text-lg font-semibold text-slate-900">Set Primary Member</h3>
+            <p className="mt-1 text-xs text-slate-500">
+              Choose which family member represents this family for this team leader. Used in the table and in export/print &ldquo;heads only&rdquo;.
+            </p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600" aria-label="Close"><X className="h-5 w-5" /></button>
+        </div>
+
+        <div className="max-h-[55vh] space-y-2 overflow-y-auto px-6 py-4">
+          {members.length === 0 ? (
+            <p className="py-8 text-center text-sm text-slate-500">No assigned members in this family.</p>
+          ) : (
+            members.map((member) => {
+              const isCurrent = currentId === member.id
+              const selected = selectedId === member.id
+              return (
+                <button
+                  key={member.id}
+                  type="button"
+                  onClick={() => setSelectedId(member.id)}
+                  className={`flex w-full items-center gap-3 rounded-xl border p-3 text-left transition ${
+                    selected ? 'border-brand-400 bg-brand-50/60 ring-2 ring-brand-100' : 'border-slate-200 hover:border-brand-300 hover:bg-brand-50/40'
+                  }`}
+                >
+                  <span className={`flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full border ${selected ? 'border-brand-500 bg-brand-500' : 'border-slate-300 bg-white'}`}>
+                    {selected && <span className="h-2 w-2 rounded-full bg-white" />}
+                  </span>
+                  <VoterAvatar voter={member} photoUrl={resolvePhotoUrl(member)} />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-slate-900">{member.name}</p>
+                    <p className="truncate text-xs text-slate-500">
+                      EPIC: {member.epic_no || '-'}{member.relative_name ? ` · ${member.relative_name}` : ''}{member.relative_relation ? ` (${member.relative_relation})` : ''}
+                    </p>
+                  </div>
+                  {isCurrent && (
+                    <span className="inline-flex flex-shrink-0 items-center rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-700">Current</span>
+                  )}
+                </button>
+              )
+            })
+          )}
+        </div>
+
+        <div className="flex items-center justify-between gap-3 border-t border-slate-200 px-6 py-4">
+          <span className="text-xs text-slate-500">{members.length} assigned member{members.length === 1 ? '' : 's'}</span>
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={onClose} className="h-10 rounded-xl border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-600 transition hover:bg-slate-100">Cancel</button>
+            <button
+              type="button"
+              disabled={!canConfirm}
+              onClick={confirm}
+              className="inline-flex h-10 items-center gap-1.5 rounded-xl bg-slate-900 px-5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <UserCog className="h-4 w-4" />} Set Primary
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export function TeamLeaderDetailPage() {
+  const { leaderId } = useParams<{ leaderId: string }>()
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const { profile, loading: authLoading } = useAuth()
+
+  const leaderListQuery = useMemo(() => (searchParams.toString() ? `?${searchParams.toString()}` : ''), [searchParams])
+
+  const initialCached = useMemo(() => {
+    if (!leaderId) return null
+    const scope = buildTeamLeaderDetailScope(leaderId, profile?.role ?? null, profile?.allowed_wards ?? null)
+    return readTeamLeaderDetailCache(scope)
+  }, [leaderId, profile?.role, profile?.allowed_wards])
+
+  const [leader, setLeader] = useState<TeamLeader | null>(initialCached?.data.leader ?? null)
+  const [leaderList, setLeaderList] = useState<TeamLeader[]>([])
+  const [leaderVoter, setLeaderVoter] = useState<Voter | null>(initialCached?.data.leaderVoter ?? null)
+  const [rows, setRows] = useState<Voter[]>(initialCached?.data.rows ?? [])
+  const [familyRows, setFamilyRows] = useState<Voter[]>(initialCached?.data.familyRows ?? [])
+  const [loading, setLoading] = useState(!initialCached)
+  const [photoUrlByPath, setPhotoUrlByPath] = useState<Record<string, string>>({})
+
+  const [visibleColumns, setVisibleColumns] = usePersistentState<MemberColumnKey[]>(VISIBLE_COLUMNS_KEY, [...DEFAULT_VISIBLE_COLUMNS])
+  const [pageSize, setPageSize] = usePersistentState<number>(PAGE_SIZE_KEY, 25)
+  const [printFields, setPrintFields] = usePersistentState<PrintFieldState[]>(PRINT_FIELDS_KEY, DEFAULT_PRINT_FIELDS.map((f) => ({ ...f })))
+  const [includeFamilyMembers, setIncludeFamilyMembers] = usePersistentState<boolean>(INCLUDE_FAMILY_MEMBERS_KEY, false)
+  const [printFontSize, setPrintFontSize] = usePersistentState<number>(PRINT_FONT_SIZE_KEY, 11)
+  const [printBold, setPrintBold] = usePersistentState<boolean>(PRINT_BOLD_KEY, false)
+  const [exportBorders, setExportBorders] = usePersistentState<boolean>(EXPORT_BORDERS_KEY, true)
+  const [exportRowHeight, setExportRowHeight] = usePersistentState<number>(EXPORT_ROW_HEIGHT_KEY, 18)
+  const [exportColWidth, setExportColWidth] = usePersistentState<number>(EXPORT_COL_WIDTH_KEY, 16)
+  const [showFamilyMembers, setShowFamilyMembers] = usePersistentState<boolean>('vote:teamleaderdetail:showFamilyMembers', false)
+  const [columnWidths, setColumnWidths] = usePersistentState<Partial<Record<MemberColumnKey, number>>>(COLUMN_WIDTHS_KEY, {})
+
+  const [remainingOpen, setRemainingOpen] = useState(false)
+  const [remainingLoading, setRemainingLoading] = useState(false)
+  const [remainingRows, setRemainingRows] = useState<Voter[]>([])
+  const [selectedRemainingFamilyKeys, setSelectedRemainingFamilyKeys] = useState<Set<string>>(new Set())
+
+  const [directVoterIds, setDirectVoterIds] = useState<Set<string>>(() => new Set(initialCached?.data.directVoterIds ?? []))
+  const [expandedFamilyKeys, setExpandedFamilyKeys] = useState<Set<string>>(new Set())
+  const [familySizeFilter, setFamilySizeFilter] = useState<number | null>(null)
+  const [detailPartFilter, setDetailPartFilter] = useState('')
+  const [detailSectionFilter, setDetailSectionFilter] = useState('')
+  const [detailReligionFilter, setDetailReligionFilter] = useState('')
+  const [detailStateFilter, setDetailStateFilter] = useState('')
+
+  const [query, setQuery] = useState('')
+  const [sortKey, setSortKey] = useState<MemberColumnKey | null>(null)
+  const [sortDir, setSortDir] = useState<SortDir>('asc')
+  const [page, setPage] = useState(1)
+
+  const [modalOpen, setModalOpen] = useState(false)
+  const [modalMode, setModalMode] = useState<'print' | 'export'>('print')
+  const [selectedVoter, setSelectedVoter] = useState<Voter | null>(null)
+  const [transferOpen, setTransferOpen] = useState(false)
+  const [transferring, setTransferring] = useState(false)
+  const [changeLeaderOpen, setChangeLeaderOpen] = useState(false)
+  const [savingLeader, setSavingLeader] = useState(false)
+  const [removeTarget, setRemoveTarget] = useState<Voter | null>(null)
+  const [removeTargetCount, setRemoveTargetCount] = useState(1)
+  const [primaryTarget, setPrimaryTarget] = useState<FamilyGroup | null>(null)
+  const [savingPrimary, setSavingPrimary] = useState(false)
+
+  const [assignQuery, setAssignQuery] = useState('')
+  const [assignResults, setAssignResults] = useState<Voter[]>([])
+  const [assignFamilyRows, setAssignFamilyRows] = useState<Voter[]>([])
+  const [assignSearching, setAssignSearching] = useState(false)
+  const [assignDropdownOpen, setAssignDropdownOpen] = useState(false)
+  const [assigning, setAssigning] = useState(false)
+  const [assignTransferring, setAssignTransferring] = useState(false)
+  const [assignTransferTarget, setAssignTransferTarget] = useState<{ family: FamilyGroup; sourceLeaderIds: string[] } | null>(null)
+  const assignRef = useRef<HTMLDivElement>(null)
+
+  const [voterToLeaderId, setVoterToLeaderId] = useState<Record<string, string>>(initialCached?.data.voterToLeaderId ?? {})
+  const [leaderNameById, setLeaderNameById] = useState<Record<string, string>>({})
+
+  const allowedWards = useMemo(() => {
+    const wards = Array.from(new Set((profile?.allowed_wards ?? []).filter((w) => Number.isFinite(w))))
+    wards.sort((a, b) => a - b)
+    return wards
+  }, [profile?.allowed_wards])
+  const hasWardRestriction = (profile?.role ?? 'user') !== 'admin' && allowedWards.length > 0
+
+  const load = useCallback(async (forceRefresh = false) => {
+    if (!leaderId) {
+      setLoading(false)
+      return
+    }
+    const detailScope = buildTeamLeaderDetailScope(leaderId, profile?.role ?? null, profile?.allowed_wards ?? null)
+    const cached = readTeamLeaderDetailCache(detailScope)
+    if (cached) {
+      setLeader(cached.data.leader)
+      setLeaderVoter(cached.data.leaderVoter)
+      setRows(cached.data.rows)
+      setFamilyRows(cached.data.familyRows)
+      setDirectVoterIds(new Set(cached.data.directVoterIds))
+      setVoterToLeaderId(cached.data.voterToLeaderId)
+      setLoading(false)
+      if (!forceRefresh && Date.now() - cached.savedAt < REFRESH_SKIP_MS) return
+    } else {
+      setLoading(true)
+    }
+
+    // Load the leader, their assigned voters and the complete family list
+    // through the shared helper so the batch "Download All (ZIP)" flow on the
+    // list page produces exactly the same data. The full assignment map is
+    // still fetched here (and only here) to power the "already assigned to X"
+    // hints on this page.
+    let familyData: LeaderFamiliesData
+    const vToL: Record<string, string> = {}
+    try {
+      const [allAssignRes, fam] = await Promise.all([
+        fetchAllAssignmentLinks(),
+        fetchLeaderFamilies(leaderId, { hasWardRestriction, allowedWards }),
+      ])
+      familyData = fam
+
+      if (allAssignRes.error) toast.error(allAssignRes.error)
+      for (const a of allAssignRes.data) {
+        if (a.voter_id) vToL[a.voter_id] = a.team_leader_id
+      }
+      setVoterToLeaderId(vToL)
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Could not load team leader data.')
+      setLoading(false)
+      return
+    }
+
+    setLeader(familyData.leader)
+    setLeaderVoter(familyData.leaderVoter)
+    setRows(familyData.rows)
+    setFamilyRows(familyData.familyRows)
+    setDirectVoterIds(new Set(familyData.directVoterIds))
+
+    setLoading(false)
+    writeTeamLeaderDetailCache(detailScope, {
+      leader: familyData.leader,
+      leaderVoter: familyData.leaderVoter,
+      rows: familyData.rows,
+      familyRows: familyData.familyRows,
+      directVoterIds: familyData.directVoterIds,
+      voterToLeaderId: vToL,
+    })
+  }, [leaderId, profile?.role, profile?.allowed_wards, hasWardRestriction, allowedWards])
+
+  useEffect(() => {
+    if (!authLoading) void load()
+  }, [load, authLoading])
+
+  // After a mutation on this page, the team-leaders list page and the
+  // not-assigned page must not show stale cached counts. Patch the list cache
+  // for the affected leaders (so returning to the list is instant and correct)
+  // and clear the unassigned cache so it refetches on next visit.
+  const syncOtherPagesAfterMutation = useCallback(async (affectedLeaderIds: string[]) => {
+    clearUnassignedDataCache()
+    await patchTeamLeadersListCacheForLeaders(profile?.role ?? null, profile?.allowed_wards ?? null, affectedLeaderIds)
+  }, [profile?.role, profile?.allowed_wards])
+
+  useEffect(() => {
+    let cancelled = false
+    const run = async () => {
+      const office = await ensureOfficeLeader()
+      if (cancelled) return
+      if (office?.created) clearTeamLeadersListCache()
+      const res = await supabase.from('team_leaders').select('*').order('part_no', { ascending: true, nullsFirst: true })
+      if (cancelled) return
+      if (res.error) { toast.error(res.error.message); return }
+      setLeaderList((res.data as TeamLeader[] | null) ?? [])
+    }
+    void run()
+    return () => { cancelled = true }
+  }, [])
+
+  // Resolve each team leader's display name (their linked voter) so the assign
+  // search can show "Already assigned to X". The Office assignee gets its own
+  // label.
+  useEffect(() => {
+    if (!leaderList.length) return
+    let cancelled = false
+    const run = async () => {
+      const voterIds = Array.from(new Set(leaderList.map((tl) => tl.voter_id).filter((id): id is string => Boolean(id))))
+      const nameById = new Map<string, string>()
+      if (voterIds.length) {
+        for (const chunk of chunksOf(voterIds, 150)) {
+          const { data } = await supabase.from('voters').select('id, name').in('id', chunk)
+          if (cancelled) return
+          for (const v of (data as Array<{ id: string; name: string }> | null) ?? []) nameById.set(v.id, v.name)
+        }
+      }
+      if (cancelled) return
+      const next: Record<string, string> = {}
+      for (const tl of leaderList) {
+        if (isOfficeLeader(tl)) { next[tl.id] = 'Office'; continue }
+        if (isShiftedLeader(tl)) { next[tl.id] = 'Shifted'; continue }
+        const name = tl.voter_id ? nameById.get(tl.voter_id) : undefined
+        if (name) next[tl.id] = name
+      }
+      setLeaderNameById((c) => (JSON.stringify(c) === JSON.stringify(next) ? c : next))
+    }
+    void run()
+    return () => { cancelled = true }
+  }, [leaderList])
+
+  // Office/Shifted leader ids - families parked under them still count as
+  // "remaining" (they have no real field team leader).
+  const specialLeaderIds = useMemo(() => specialLeaderIdSet(leaderList), [leaderList])
+
+  const leaderListIndex = useMemo(() => leaderList.findIndex((tl) => tl.id === leaderId), [leaderList, leaderId])
+  const prevLeaderId = leaderListIndex > 0 ? leaderList[leaderListIndex - 1]?.id : null
+  const nextLeaderId = leaderListIndex >= 0 && leaderListIndex < leaderList.length - 1 ? leaderList[leaderListIndex + 1]?.id : null
+
+  const families = useMemo(() => buildFamilies([...rows, ...familyRows]), [rows, familyRows])
+
+  const familySizeDistribution = useMemo(() => {
+    const counts = new Map<number, number>()
+    for (const family of families) {
+      const size = family.members.length
+      counts.set(size, (counts.get(size) ?? 0) + 1)
+    }
+    return Array.from(counts.entries()).sort((a, b) => a[0] - b[0])
+  }, [families])
+  const familyByEpic = useMemo(() => {
+    const m = new Map<string, FamilyGroup>()
+    for (const f of families) m.set(normalizeLookupValue(f.head), f)
+    return m
+  }, [families])
+
+  const familyForVoter = useCallback((v: Voter): FamilyGroup => {
+    const key = buildFamilyHeadEpic(v)
+    return familyByEpic.get(key) ?? { key: `GROUP|${key}`, head: key, headVoter: v, members: [v] }
+  }, [familyByEpic])
+
+  const assignedIds = useMemo(() => new Set(rows.map((r) => r.id)), [rows])
+
+  const familyRepresentative = useCallback((family: FamilyGroup): Voter | null => {
+    return (
+      family.members.find((m) => assignedIds.has(m.id) && directVoterIds.has(m.id))
+      ?? (family.headVoter && assignedIds.has(family.headVoter.id) ? family.headVoter : null)
+      ?? family.members.find((m) => assignedIds.has(m.id))
+      ?? null
+    )
+  }, [assignedIds, directVoterIds])
+
+  // "Remaining families" - voters in this team leader's part/section that have
+  // not been assigned to any team leader yet. Families are identified by
+  // family_head_epic and only families where NO member is assigned anywhere
+  // (excluding families parked under Office/Shifted, which still count as
+  // remaining) are considered remaining.
+  const loadRemaining = useCallback(async () => {
+    if (!leaderId || !leader) return
+    setRemainingOpen(true)
+    setRemainingLoading(true)
+    try {
+      const assignedRows = await fetchAllPages<{ voter_id: string; team_leader_id: string | null }>(async (from, to) => supabase.from('team_leader_assignments').select('voter_id, team_leader_id').range(from, to), 1000)
+      const assignedSet = new Set(
+        assignedRows
+          .filter((a) => a.team_leader_id && !specialLeaderIds.has(a.team_leader_id))
+          .map((a) => a.voter_id)
+          .filter(Boolean),
+      )
+
+      let req = supabase.from('voters').select('*').eq('part_no', leader.part_no)
+      if (leader.section != null) req = req.eq('section', leader.section)
+      if (hasWardRestriction) req = req.in('ward_no', allowedWards)
+      const { data: partVoters, error } = await req
+      if (error) {
+        toast.error(error.message)
+        setRemainingRows([])
+        return
+      }
+      const voters = (partVoters as Voter[] | null) ?? []
+
+      // Only families where no member is assigned anywhere.
+      const remaining: Voter[] = []
+      const groups = new Map<string, Voter[]>()
+      for (const v of voters) {
+        const key = normalizeLookupValue(v.family_head_epic) || normalizeLookupValue(v.epic_no)
+        if (!key) continue
+        const arr = groups.get(key)
+        if (arr) arr.push(v)
+        else groups.set(key, [v])
+      }
+      for (const [key, members] of groups) {
+        if (members.some((m) => assignedSet.has(m.id))) continue
+        const sorted = [...members].sort((a, b) => {
+          const aIsHead = normalizeLookupValue(a.epic_no) === key
+          const bIsHead = normalizeLookupValue(b.epic_no) === key
+          if (aIsHead && !bIsHead) return -1
+          if (!aIsHead && bIsHead) return 1
+          if (a.display_order != null && b.display_order != null) return a.display_order - b.display_order
+          return (a.updated_at ?? a.created_at ?? '').localeCompare(b.updated_at ?? b.created_at ?? '')
+        })
+        remaining.push(...sorted)
+      }
+      setRemainingRows(remaining)
+      setSelectedRemainingFamilyKeys(new Set())
+    } finally {
+      setRemainingLoading(false)
+    }
+  }, [leaderId, leader, hasWardRestriction, allowedWards, specialLeaderIds])
+
+  const remainingFamilies = useMemo(() => {
+    if (!remainingRows.length) return []
+    return buildFamilies(remainingRows)
+  }, [remainingRows])
+
+  const selectedRemainingFamilies = useMemo(() => {
+    if (!selectedRemainingFamilyKeys.size) return []
+    return remainingFamilies.filter((family) => selectedRemainingFamilyKeys.has(family.key))
+  }, [remainingFamilies, selectedRemainingFamilyKeys])
+
+  const assignResultFamilies = useMemo(() => {
+    if (!assignResults.length) return []
+    const searchedIds = new Set(assignResults.map((v) => v.id))
+    // Search results and the family-member fetch can both contain the same
+    // voter (e.g. the matched head), so dedupe by voter id before grouping -
+    // otherwise buildFamilies would report a voter more than once per family.
+    const seen = new Set<string>()
+    const merged: Voter[] = []
+    for (const voter of [...assignResults, ...assignFamilyRows]) {
+      if (seen.has(voter.id)) continue
+      seen.add(voter.id)
+      merged.push(voter)
+    }
+    return buildFamilies(merged).filter((family) =>
+      family.members.some((member) => searchedIds.has(member.id)),
+    )
+  }, [assignResults, assignFamilyRows])
+
+  const visiblePhotoPaths = useMemo(() => {
+    const set = new Set<string>()
+    if (leaderVoter?.photo_url) set.add(leaderVoter.photo_url)
+    for (const v of [...rows, ...familyRows, ...remainingRows, ...assignFamilyRows]) {
+      if (v.photo_url) set.add(v.photo_url)
+    }
+    return Array.from(set)
+  }, [leaderVoter, rows, familyRows, remainingRows, assignFamilyRows])
+
+  useEffect(() => {
+    let cancelled = false
+    const run = async () => {
+      const missing = visiblePhotoPaths.filter((p) => !photoUrlByPath[p])
+      if (!missing.length) return
+      for (let i = 0; i < missing.length; i += 80) {
+        if (cancelled) return
+        const batch = missing.slice(i, i + 80)
+        const { data } = await supabase.storage.from('voter-photos').createSignedUrls(batch, 3600)
+        if (cancelled || !data) continue
+        const next: Record<string, string> = {}
+        for (let j = 0; j < batch.length; j++) { const url = data[j]?.signedUrl; if (url) next[batch[j]] = url }
+        if (Object.keys(next).length) setPhotoUrlByPath((c) => ({ ...c, ...next }))
+      }
+    }
+    void run()
+    return () => { cancelled = true }
+  }, [photoUrlByPath, visiblePhotoPaths])
+
+  const resolvePhotoUrl = useCallback((voter: Voter | null | undefined): string => {
+    if (!voter?.photo_url) return ''
+    return photoUrlByPath[voter.photo_url] ?? ''
+  }, [photoUrlByPath])
+
+  // True once every photo that this page shows has a signed URL (or there are
+  // none). Used by the auto-download flow so exports with embedded photos are
+  // not generated before the photos resolve.
+  const allPhotosReady = useMemo(
+    () => visiblePhotoPaths.every((path) => photoUrlByPath[path]),
+    [visiblePhotoPaths, photoUrlByPath],
+  )
+
+  const renderVoterCells = useCallback((voter: Voter, family: FamilyGroup, sr: number | null, isMemberRow: boolean) => {
+    const memberCount = family.members.length
+    return MEMBER_COLUMNS.filter((c) => visibleColumns.includes(c.key)).map((col) => {
+      const widthStyle = columnWidths[col.key] != null ? { width: columnWidths[col.key] } : undefined
+      if (col.key === 'srNo') {
+        return (
+          <td key={col.key} style={widthStyle} className="border-b border-slate-100 px-5 py-3.5 text-slate-500">
+            {sr ?? ''}
+          </td>
+        )
+      }
+      if (col.key === 'photo') {
+        return (
+          <td key={col.key} style={widthStyle} className="border-b border-slate-100 px-5 py-3.5">
+            {voter.photo_url ? <VoterAvatar voter={voter} photoUrl={resolvePhotoUrl(voter)} /> : <span className="text-xs text-slate-400">-</span>}
+          </td>
+        )
+      }
+      if (col.key === 'familyMembers') {
+        return (
+          <td key={col.key} style={widthStyle} className="border-b border-slate-100 px-5 py-3.5">
+            <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${memberCount > 0 ? 'bg-brand-50 text-brand-700' : 'bg-slate-100 text-slate-500'}`}>
+              {memberCount}
+            </span>
+          </td>
+        )
+      }
+      if (col.key === 'contact1') {
+        const contact = resolveContact(voter, family)
+        const ownNumber = vf(voter, 'contact_no_1') || vf(voter, 'contact_no_2')
+        const viaName = !ownNumber && contact.ownerName && contact.ownerName !== vf(voter, 'name') ? contact.ownerName : ''
+        return (
+          <td key={col.key} style={widthStyle} className="border-b border-slate-100 px-5 py-3.5 text-slate-600">
+            {contact.number ? (
+              <span title={viaName ? `via ${viaName}` : undefined}>{contact.number}</span>
+            ) : '-'}
+          </td>
+        )
+      }
+      const isName = col.key === 'name'
+      return (
+        <td key={col.key} style={widthStyle} className={`border-b border-slate-100 px-5 py-3.5 ${isName ? 'font-semibold text-slate-900' : 'text-slate-600'}`}>
+          {isMemberRow && isName ? (
+            <span className="inline-flex items-center gap-1.5"><span className="text-slate-400">↳</span>{getVoterFieldValue(voter, col.key, family)}</span>
+          ) : (
+            getVoterFieldValue(voter, col.key, family)
+          )}
+        </td>
+      )
+    })
+  }, [resolvePhotoUrl, visibleColumns, columnWidths])
+
+  const tokens = useMemo(() => tokenizeLookup(query), [query])
+
+  // Filter dropdown options for the Office / Shifted views. Those leaders have
+  // no part/section of their own, so the options are derived from the assigned
+  // families' head voters.
+  const isSpecialLeaderView = isOfficeLeader(leader) || isShiftedLeader(leader)
+
+  const detailPartOptions = useMemo(() => {
+    const parts = new Set<number>()
+    for (const f of families) {
+      const rep = f.headVoter ?? f.members[0]
+      if (rep?.part_no != null) parts.add(rep.part_no)
+    }
+    return Array.from(parts).sort((a, b) => a - b)
+  }, [families])
+
+  const detailSectionOptions = useMemo(() => {
+    if (!detailPartFilter) return []
+    const partNum = Number(detailPartFilter)
+    if (!Number.isFinite(partNum)) return []
+    const sections = new Set<number>()
+    for (const f of families) {
+      const rep = f.headVoter ?? f.members[0]
+      if (rep?.part_no === partNum && rep.section != null) sections.add(rep.section)
+    }
+    return Array.from(sections).sort((a, b) => a - b)
+  }, [families, detailPartFilter])
+
+  const detailReligionOptions = useMemo(() => {
+    const rels = new Set<string>()
+    for (const f of families) {
+      const rep = f.headVoter ?? f.members[0]
+      if (rep?.religion) rels.add(rep.religion)
+    }
+    return Array.from(rels).sort((a, b) => a.localeCompare(b))
+  }, [families])
+
+  const detailStateOptions = useMemo(() => {
+    const states = new Set<string>()
+    for (const f of families) {
+      const rep = f.headVoter ?? f.members[0]
+      if (rep?.state) states.add(rep.state)
+    }
+    return Array.from(states).sort((a, b) => a.localeCompare(b))
+  }, [families])
+
+  useEffect(() => {
+    if (detailPartFilter && detailSectionFilter) {
+      const valid = detailSectionOptions.some((s) => String(s) === detailSectionFilter)
+      if (!valid) setDetailSectionFilter('')
+    }
+  }, [detailSectionOptions, detailSectionFilter, detailPartFilter])
+
+  // When a family size is selected in the dashboard, only families with that
+  // many members are shown. When "show family members" is enabled, each family
+  // is displayed as a merged block (head row + member rows below it) instead
+  // of a flat list of members. Otherwise one representative per family is
+  // shown (family members are assigned but hidden until revealed).
+  const visibleFamilies = useMemo(() => {
+    return families.filter((f) => {
+      if (familySizeFilter != null && f.members.length !== familySizeFilter) return false
+      const rep = f.headVoter ?? f.members[0]
+      if (detailPartFilter && (rep?.part_no == null || String(rep.part_no) !== detailPartFilter)) return false
+      if (detailSectionFilter && (rep?.section == null || String(rep.section) !== detailSectionFilter)) return false
+      if (detailReligionFilter && (rep?.religion ?? '') !== detailReligionFilter) return false
+      if (detailStateFilter && (rep?.state ?? '') !== detailStateFilter) return false
+      return true
+    })
+  }, [families, familySizeFilter, detailPartFilter, detailSectionFilter, detailReligionFilter, detailStateFilter])
+
+  // In the default (heads-only) view, one representative per family is shown.
+  // Every assigned family must be listed - not just ones with a direct
+  // (is_direct) voter - otherwise families assigned with no direct voter
+  // would silently disappear from the table.
+  const displayRows = useMemo(() => {
+    if (!showFamilyMembers) {
+      const out: Voter[] = []
+      for (const family of visibleFamilies) {
+        const rep = familyRepresentative(family)
+        if (rep) out.push(rep)
+      }
+      return out
+    }
+    return visibleFamilies.map((f) => f.headVoter ?? f.members[0]).filter(Boolean) as Voter[]
+  }, [showFamilyMembers, visibleFamilies, familyRepresentative])
+
+  // Search matches the whole family, so typing a family member's name finds
+  // that family's representative row too - not just the head voter.
+  const filteredHeads = useMemo(() => {
+    if (!tokens.length) return displayRows
+    return displayRows.filter((v) => {
+      const family = familyForVoter(v)
+      return family.members.some((m) => matchesLookupTokens(voterSearchText(m), tokens))
+    })
+  }, [displayRows, tokens, familyForVoter])
+
+  const sortedHeads = useMemo(() => {
+    if (!sortKey) return filteredHeads
+    const dir = sortDir === 'asc' ? 1 : -1
+    return [...filteredHeads].sort((a, b) => {
+      const va = getVoterFieldValue(a, sortKey, familyForVoter(a))
+      const vb = getVoterFieldValue(b, sortKey, familyForVoter(b))
+      const na = Number(va)
+      const nb = Number(vb)
+      if (!Number.isNaN(na) && !Number.isNaN(nb) && va !== '-' && vb !== '-' && va !== '' && vb !== '') {
+        return (na - nb) * dir
+      }
+      return va.localeCompare(vb) * dir
+    })
+  }, [filteredHeads, sortKey, sortDir, familyForVoter])
+
+  const pageCount = Math.max(1, Math.ceil(sortedHeads.length / pageSize))
+  const currentPage = Math.min(page, pageCount)
+  const pageStartIndex = (currentPage - 1) * pageSize
+  const pageHeads = sortedHeads.slice(pageStartIndex, pageStartIndex + pageSize)
+
+  const toggleSort = (key: MemberColumnKey) => {
+    if (sortKey === key) {
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
+    } else {
+      setSortKey(key)
+      setSortDir('asc')
+    }
+  }
+
+  const toggleFamilyExpand = (key: string) => {
+    setExpandedFamilyKeys((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  // Totals follow the same part/section/religion/state filter as the table
+  // (visibleFamilies), so the summary cards, export, print and PDF all reflect
+  // the current filtered selection on the Office/Shifted views.
+  const totalMembers = useMemo(() => visibleFamilies.reduce((sum, f) => sum + f.members.length, 0), [visibleFamilies])
+  const maleCount = useMemo(
+    () => visibleFamilies.reduce((sum, f) => sum + f.members.filter((m) => (m.gender ?? '').toLowerCase() === 'male').length, 0),
+    [visibleFamilies],
+  )
+  const femaleCount = useMemo(
+    () => visibleFamilies.reduce((sum, f) => sum + f.members.filter((m) => (m.gender ?? '').toLowerCase() === 'female').length, 0),
+    [visibleFamilies],
+  )
+
+  const leaderSlug = useMemo(() => {
+    const slug = (leaderVoter?.name ?? 'team-leader').trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')
+    return slug || 'team-leader'
+  }, [leaderVoter])
+
+  const leaderDisplayName = useMemo(
+    () => isOfficeLeader(leader) ? 'Office' : isShiftedLeader(leader) ? 'Shifted' : (leaderVoter?.name ?? 'Team Leader'),
+    [leader, leaderVoter],
+  )
+
+  // Fixed 9-column template that mirrors the reference export exactly:
+  // merged title/contact/stats header block, a spacer row, a bold column
+  // header row, then one photo-embedded row per voter. Column widths and
+  // row heights are hardcoded (not user-adjustable) because they exist to
+  // fit the embedded photos - the rowHeight/colWidth sliders are ignored
+  // here on purpose so every export matches the template pixel-for-pixel.
+  const EXPORT_TEMPLATE_COLUMNS: Array<{ key: MemberColumnKey; label: string; width: number }> = [
+    { key: 'srNo', label: 'Sr No', width: 4.14 },
+    { key: 'photo', label: 'Photo', width: 15.86 },
+    { key: 'name', label: 'Name', width: 20.43 },
+    { key: 'relativeName', label: 'Relative Name', width: 20.43 },
+    { key: 'epicNo', label: 'EPIC', width: 16.29 },
+    { key: 'partNo', label: 'Part', width: 7.71 },
+    { key: 'section', label: 'Section', width: 7.14 },
+    { key: 'contact1', label: 'Contact No 1', width: 17.57 },
+    { key: 'familyMembers', label: 'Family', width: 5.29 },
+  ]
+  const EXPORT_TITLE_ROW = 1
+  const EXPORT_INFO_ROW = 2
+  const EXPORT_SPACER_ROW = 3
+  const EXPORT_COLUMN_HEADER_ROW = 4
+  const EXPORT_FIRST_DATA_ROW = 5
+  const EXPORT_DATA_ROW_HEIGHT = 80.1
+  const EXPORT_INFO_ROW_HEIGHT = 82.5
+  const EXPORT_SPACER_ROW_HEIGHT = 12
+  const EXPORT_PHOTO_TARGET_HEIGHT_PX = 84
+  const EXPORT_PHOTO_MAX_WIDTH_PX = 92
+  // Every column in the reference file is centered + wrapped, so alignment
+  // is applied uniformly in styleCell(); only bold varies (Sr No isn't bold).
+  const EXPORT_NOT_BOLD_KEYS = new Set<MemberColumnKey>(['srNo'])
+
+  // Optional org logo shown in the header block (column B, rows 1-2), to
+  // match the reference file's letterhead. Left blank by default since no
+  // logo asset is wired up yet - set this to a real URL/path to enable it.
+  const EXPORT_ORG_LOGO_URL = ''
+
+  const doExport = async (
+    _fields: PrintFieldState[],
+    include: boolean,
+    borders: boolean,
+    _rowHeight: number,
+    _colWidth: number,
+  ) => {
+    const leaderName = leaderDisplayName
+    const leaderContact = leaderVoter ? (resolveContact(leaderVoter).number || '-') : '-'
+
+    // The reference file's title reads "PART <n> MN KARYAKARTA" - derive
+    // <n> from the most common part number across this leader's families
+    // rather than hardcoding it, so the export stays correct for any team.
+    const reportTitle = (() => {
+      const counts = new Map<string, number>()
+      for (const family of visibleFamilies) {
+        const partNo = vf(family.headVoter ?? family.members[0], 'part_no')
+        if (!partNo) continue
+        counts.set(partNo, (counts.get(partNo) ?? 0) + 1)
+      }
+      let bestPart = ''
+      let bestCount = 0
+      for (const [partNo, count] of counts) {
+        if (count > bestCount) { bestPart = partNo; bestCount = count }
+      }
+      return bestPart ? `PART ${bestPart} MN KARYAKARTA` : 'MN KARYAKARTA'
+    })()
+
+    // Build the flat list of (voter, family) rows to export - either every
+    // family member, or heads-only - with no blank separator rows, matching
+    // the reference file.
+    type ExportRow = { voter: Voter; family: FamilyGroup }
+    const exportRows: ExportRow[] = []
+    if (include) {
+      for (const family of visibleFamilies) {
+        for (const member of family.members) exportRows.push({ voter: member, family })
+      }
+    } else {
+      for (const family of visibleFamilies) {
+        const rep = familyRepresentative(family)
+        if (rep) exportRows.push({ voter: rep, family })
+      }
+    }
+
+    const ExcelJS = (await import('exceljs')).default
+    const workbook = new ExcelJS.Workbook()
+    const sheet = workbook.addWorksheet('Team Leader Report')
+
+    // ---- Column widths (fixed, mirrors the reference template) ----
+    EXPORT_TEMPLATE_COLUMNS.forEach((col, i) => {
+      sheet.getColumn(i + 1).width = col.width
+    })
+
+    // ---- Merged header block: title / contact / stats ----
+    sheet.mergeCells(EXPORT_TITLE_ROW, 1, EXPORT_TITLE_ROW, 3) // A1:C1
+    sheet.mergeCells(EXPORT_TITLE_ROW, 4, EXPORT_TITLE_ROW, 7) // D1:G1
+    sheet.mergeCells(EXPORT_TITLE_ROW, 8, EXPORT_TITLE_ROW, 9) // H1:I1
+    sheet.mergeCells(EXPORT_INFO_ROW, 4, EXPORT_INFO_ROW, 7) // D2:G2
+    sheet.mergeCells(EXPORT_INFO_ROW, 8, EXPORT_INFO_ROW, 9) // H2:I2
+
+    sheet.getRow(EXPORT_TITLE_ROW).getCell(1).value = reportTitle
+    sheet.getRow(EXPORT_TITLE_ROW).getCell(4).value = 'Contact'
+    sheet.getRow(EXPORT_TITLE_ROW).getCell(8).value = `Total Members = ${totalMembers}`
+    sheet.getRow(EXPORT_INFO_ROW).getCell(3).value = leaderName
+    sheet.getRow(EXPORT_INFO_ROW).getCell(4).value = leaderContact
+    sheet.getRow(EXPORT_INFO_ROW).getCell(8).value = `Assigned Families = ${visibleFamilies.length}`
+
+    // ---- Column header row ----
+    EXPORT_TEMPLATE_COLUMNS.forEach((col, i) => {
+      sheet.getRow(EXPORT_COLUMN_HEADER_ROW).getCell(i + 1).value = col.label
+    })
+
+    // ---- Row heights ----
+    sheet.getRow(EXPORT_TITLE_ROW).height = EXPORT_DATA_ROW_HEIGHT
+    sheet.getRow(EXPORT_INFO_ROW).height = EXPORT_INFO_ROW_HEIGHT
+    sheet.getRow(EXPORT_SPACER_ROW).height = EXPORT_SPACER_ROW_HEIGHT
+    sheet.getRow(EXPORT_COLUMN_HEADER_ROW).height = EXPORT_DATA_ROW_HEIGHT
+
+    // ---- Styling shared by every populated cell: thin black borders,
+    // Calibri, centered + wrapped, size 16 for the title / 14 elsewhere ----
+    const borderStyle = { style: 'thin' } as const
+    const cellBorder = borders
+      ? { top: borderStyle, bottom: borderStyle, left: borderStyle, right: borderStyle }
+      : undefined
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- ExcelJS is loaded via dynamic import, so its
+    // cell type isn't available as a named type here; `any` mirrors how the rest of this function treats it.
+    const styleCell = (cell: any, opts: { size: number; bold: boolean }) => {
+      if (cellBorder) cell.border = cellBorder
+      cell.font = { name: 'Calibri', size: opts.size, bold: opts.bold }
+      cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }
+    }
+
+    // Columns A-G (title / contact block) are size 16; columns H-I (the
+    // "Total Members" / "Assigned Families" stat cells) are size 14 -
+    // matches the reference file exactly.
+    for (let c = 1; c <= 9; c++) {
+      const size = c <= 7 ? 16 : 14
+      styleCell(sheet.getRow(EXPORT_TITLE_ROW).getCell(c), { size, bold: true })
+      styleCell(sheet.getRow(EXPORT_INFO_ROW).getCell(c), { size, bold: true })
+    }
+    for (let c = 1; c <= 9; c++) styleCell(sheet.getRow(EXPORT_COLUMN_HEADER_ROW).getCell(c), { size: 14, bold: true })
+
+    // ---- Optional org logo in the header block (column B, rows 1-2) ----
+    if (EXPORT_ORG_LOGO_URL) {
+      const logo = await fetchImageForExcel(EXPORT_ORG_LOGO_URL)
+      if (logo) {
+        const imageId = workbook.addImage({ base64: logo.base64, extension: logo.extension })
+        sheet.addImage(imageId, {
+          tl: { col: 1.05, row: 0.05 },
+          ext: { width: 82, height: 82 },
+        })
+      }
+    }
+
+    // ---- Data rows: one row per voter, each with an embedded photo ----
+    let sr = 1
+    for (let i = 0; i < exportRows.length; i++) {
+      // Yield periodically so exporting thousands of rows never freezes the tab.
+      if (i > 0 && i % 200 === 0) await new Promise((resolve) => setTimeout(resolve, 0))
+
+      const { voter, family } = exportRows[i]
+      const rowNumber = EXPORT_FIRST_DATA_ROW + i
+      const row = sheet.getRow(rowNumber)
+      row.height = EXPORT_DATA_ROW_HEIGHT
+
+      EXPORT_TEMPLATE_COLUMNS.forEach((col, c) => {
+        const cell = row.getCell(c + 1)
+        if (col.key === 'srNo') {
+          cell.value = String(sr)
+        } else if (col.key === 'photo') {
+          cell.value = null // populated with an embedded image below
+        } else {
+          cell.value = getVoterFieldValue(voter, col.key, family) || null
+        }
+        styleCell(cell, { size: 14, bold: !EXPORT_NOT_BOLD_KEYS.has(col.key) })
+      })
+      sr += 1
+
+      const photoColIndex = EXPORT_TEMPLATE_COLUMNS.findIndex((c) => c.key === 'photo')
+      const photoUrl = resolvePhotoUrl(voter)
+      if (photoUrl) {
+        const img = await fetchImageForExcel(photoUrl)
+        if (img) {
+          const scale = Math.min(
+            EXPORT_PHOTO_TARGET_HEIGHT_PX / img.height,
+            EXPORT_PHOTO_MAX_WIDTH_PX / img.width,
+            1,
+          )
+          const width = Math.round(img.width * scale)
+          const height = Math.round(img.height * scale)
+          const imageId = workbook.addImage({ base64: img.base64, extension: img.extension })
+          sheet.addImage(imageId, {
+            tl: { col: photoColIndex + 0.15, row: rowNumber - 1 + 0.08 },
+            ext: { width, height },
+          })
+        }
+      }
+    }
+
+    sheet.pageSetup = {
+      orientation: 'landscape',
+      fitToPage: true,
+      fitToWidth: 1,
+      fitToHeight: 0,
+    }
+
+    const buffer = await workbook.xlsx.writeBuffer()
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${leaderSlug}-assigned-voters-${new Date().toISOString().slice(0, 10)}.xlsx`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+    toast.success('Excel file exported.')
+  }
+
+  const doPrint = (fields: PrintFieldState[], include: boolean, fontSize: number, bold: boolean, widths?: Partial<Record<MemberColumnKey, number>>) => {
+    const enabled = fields.filter((f) => f.enabled)
+    const headerLabels = enabled.map((f) => PRINT_FIELD_DEFS.find((d) => d.key === f.key)!.label)
+    const escapeHtml = (value: string) =>
+      value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    const photoSize = Math.max(10, Math.round(30 * (fontSize / 11)))
+
+    const renderRow = (voter: Voter, family: FamilyGroup, sr: number, isHead: boolean) => {
+      const photoUrl = resolvePhotoUrl(voter)
+      const cells = enabled
+        .map((f) => {
+          const cellStyle = getPrintColumnStyleWithWidths(f.key, widths ?? {})
+          if (f.key === 'srNo') return `<td style="${cellStyle}">${sr}</td>`
+          if (f.key === 'photo') return `<td style="${cellStyle}">${photoUrl ? `<img class="photo" src="${escapeHtml(photoUrl)}" decoding="async" />` : ''}</td>`
+          return `<td style="${cellStyle}">${escapeHtml(getPrintFieldValue(voter, f.key, family, photoUrl))}</td>`
+        })
+        .join('')
+      return `<tr class="${isHead ? 'head-row' : ''}">${cells}</tr>`
+    }
+
+    let bodyHtml = ''
+    bodyHtml += `<table><thead><tr>${headerLabels.map((label) => `<th>${escapeHtml(label)}</th>`).join('')}</tr></thead><tbody>`
+    if (include) {
+      let sr = 1
+      visibleFamilies.forEach((family, familyIndex) => {
+        for (const member of family.members) {
+          const isHead = compactLookupValue(member.epic_no) === compactLookupValue(family.head)
+          bodyHtml += renderRow(member, family, sr, isHead)
+          sr += 1
+        }
+        if (familyIndex < visibleFamilies.length - 1) {
+          bodyHtml += `<tr class="family-spacer"><td colspan="${headerLabels.length}"></td></tr>`
+        }
+      })
+    } else {
+      let sr = 1
+      for (const family of visibleFamilies) {
+        const rep = familyRepresentative(family)
+        if (!rep) continue
+        bodyHtml += renderRow(rep, family, sr, true)
+        sr += 1
+      }
+    }
+    bodyHtml += '</tbody></table>'
+
+    const leaderName = leaderDisplayName
+    const summaryItems: Array<[string, string]> = [
+      ['Team Leader', leaderName],
+      ['EPIC', leaderVoter?.epic_no ?? ''],
+      ['Part / Section', leader ? `${leader.part_no ?? '-'} / ${leader.section ?? '-'}` : ''],
+      ['Assigned Families', String(visibleFamilies.length)],
+      ['Total Family Members', String(totalMembers)],
+      ['Male / Female', `${maleCount} / ${femaleCount}`],
+      ['Generated', new Date().toLocaleString()],
+    ].filter(([, value]) => Boolean(value)) as Array<[string, string]>
+
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>${escapeHtml(leaderName)} - Assigned Voters</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; color: #111; padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .summary { display: flex; flex-wrap: wrap; gap: 6px 24px; font-size: 12px; color: #333; margin-bottom: 16px; }
+  .summary-item { display: flex; gap: 6px; align-items: baseline; }
+  .summary-item span { color: #666; }
+  .summary-item strong { font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: ${fontSize}px; }
+  th, td { border: 1px solid #ccc; padding: 4px 6px; text-align: left; vertical-align: middle; }
+  th { background: #f0f0f0; }
+  ${bold ? 'th, td { font-weight: 700; }' : ''}
+  .photo { width: ${photoSize}px; height: ${photoSize}px; object-fit: cover; border-radius: 50%; }
+  .head-row { background: #f7f7f7; font-weight: 600; }
+  .family-spacer td { border: none; padding: 4px; }
+  @media print { tr { break-inside: avoid; } }
+</style>
+</head>
+<body>
+  <h1>${escapeHtml(leaderName)} - Assigned Voters</h1>
+  <div class="summary">
+    ${summaryItems.map(([label, value]) => `<div class="summary-item"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('')}
+  </div>
+  ${bodyHtml}
+</body>
+</html>`
+
+    openPrintWindow(html)
+  }
+
+  const doDownloadPdf = async (fields: PrintFieldState[], include: boolean, fontSize: number, bold: boolean) => {
+    const leaderName = leaderDisplayName
+    const pdfToast = toast.loading('Preparing PDF...')
+    try {
+      // Build the PDF through the shared helper so the batch "Download All
+      // (ZIP)" flow on the list page produces byte-identical single-leader
+      // PDFs. The filename/slug stays here, owned by the caller.
+      const blob = await buildLeaderPdfBlob({
+        leader,
+        leaderVoter,
+        families: visibleFamilies,
+        settings: {
+          fields: fields.map((f) => ({ key: f.key, enabled: f.enabled })),
+          includeFamilyMembers: include,
+          fontSize,
+          boldText: bold,
+          assignedVoterIds: assignedIds,
+          directVoterIds,
+          resolvePhotoUrl,
+        },
+      })
+      saveBlob(blob, `${leaderName.trim().replace(/[^a-z0-9]+/gi, '-').replace(/(^-|-$)/g, '').toLowerCase() || 'team-leader'}-assigned-voters-${new Date().toISOString().slice(0, 10)}.pdf`)
+      toast.success('PDF downloaded.', { id: pdfToast })
+    } catch {
+      toast.error('Could not generate the PDF.', { id: pdfToast })
+    }
+  }
+
+  const openModalFor = (mode: 'print' | 'export') => {
+    setModalMode(mode)
+    setModalOpen(true)
+  }
+
+  const handleModalConfirm = (
+    fields: ReportFieldItem[],
+    include: boolean,
+    style: PrintStyleOptions,
+  ) => {
+    const nextFields: PrintFieldState[] = fields.map((f) => ({ key: f.key as PrintFieldKey, enabled: f.enabled }))
+    setPrintFields(nextFields.map((f) => ({ ...f })))
+    setIncludeFamilyMembers(include)
+    setModalOpen(false)
+    if (modalMode === 'print') {
+      setPrintFontSize(style.fontSize)
+      setPrintBold(style.boldText)
+      doPrint(nextFields, include, style.fontSize, style.boldText, columnWidths)
+    } else {
+      setExportBorders(style.exportBorders)
+      setExportRowHeight(style.exportRowHeight)
+      setExportColWidth(style.exportColWidth)
+      void doExport(nextFields, include, style.exportBorders, style.exportRowHeight, style.exportColWidth)
+    }
+  }
+
+  const handlePdfDownload = (
+    fields: ReportFieldItem[],
+    include: boolean,
+    style: PrintStyleOptions,
+  ) => {
+    const nextFields: PrintFieldState[] = fields.map((field) => ({ key: field.key as PrintFieldKey, enabled: field.enabled }))
+    setPrintFields(nextFields.map((field) => ({ ...field })))
+    setIncludeFamilyMembers(include)
+    setPrintFontSize(style.fontSize)
+    setPrintBold(style.boldText)
+    setModalOpen(false)
+    void doDownloadPdf(nextFields, include, style.fontSize, style.boldText)
+  }
+
+  // Auto-download triggered by the per-leader button on the team-leaders list
+  // page (navigates here with ?download=excel or ?download=pdf). Reuses the
+  // exact same export paths as the toolbar buttons with the saved settings;
+  // once fired, the query param is stripped so a refresh does not re-download.
+  const autoDownloadDone = useRef(false)
+  const latestDoExport = useRef(doExport)
+  const latestDoDownloadPdf = useRef(doDownloadPdf)
+
+  useEffect(() => {
+    latestDoExport.current = doExport
+    latestDoDownloadPdf.current = doDownloadPdf
+  })
+
+  useEffect(() => {
+    const mode = searchParams.get('download')
+    if (!mode || loading || autoDownloadDone.current) return
+
+    const run = () => {
+      autoDownloadDone.current = true
+      if (mode === 'pdf') {
+        void latestDoDownloadPdf.current(printFields, includeFamilyMembers, printFontSize, printBold)
+      } else {
+        void latestDoExport.current(printFields, includeFamilyMembers, exportBorders, exportRowHeight, exportColWidth)
+      }
+      const next = new URLSearchParams(searchParams)
+      next.delete('download')
+      setSearchParams(next, { replace: true })
+    }
+
+    if (allPhotosReady) {
+      run()
+      return
+    }
+    // Photos are still resolving - wait briefly before exporting so embedded
+    // photos are not missed, but fall back to a timer so a photo that can
+    // never resolve does not block the download forever.
+    const timer = window.setTimeout(run, 2500)
+    return () => window.clearTimeout(timer)
+  }, [searchParams, loading, allPhotosReady, printFields, includeFamilyMembers, printFontSize, printBold, exportBorders, exportRowHeight, exportColWidth, setSearchParams])
+
+  const assignTokens = useMemo(() => tokenizeLookup(assignQuery), [assignQuery])
+
+  useEffect(() => {
+    if (!assignQuery.trim()) { setAssignResults([]); setAssignFamilyRows([]); return }
+    let cancelled = false
+    const run = async () => {
+      setAssignSearching(true)
+      const trimmed = assignQuery.trim()
+      const searchTokens = tokenizeLookup(trimmed)
+
+      if (searchTokens.length === 1 && isLikelyEpicToken(searchTokens[0])) {
+        const epicToken = compactLookupValue(searchTokens[0])
+        let exactReq = supabase.from('voters').select('*').eq('epic_no', epicToken)
+        if (hasWardRestriction) exactReq = exactReq.in('ward_no', allowedWards)
+        const { data: exactRow } = await exactReq.maybeSingle()
+        if (cancelled) return
+        setAssignResults(exactRow ? [exactRow as Voter] : [])
+        setAssignSearching(false)
+        return
+      }
+
+      const sp = `%${escapeIlikePattern(trimmed).replace(/\s+/g, '%')}%`
+      let req = supabase.from('voters').select('*').or([`name.ilike.${sp}`,`relative_name.ilike.${sp}`,`epic_no.ilike.${sp}`,`contact_no_1.ilike.${sp}`,`house_no.ilike.${sp}`].join(',')).limit(20)
+      if (hasWardRestriction) req = req.in('ward_no', allowedWards)
+      const { data: matches } = await req
+      if (cancelled) return
+      setAssignResults((matches as Voter[] | null) ?? [])
+      setAssignSearching(false)
+    }
+    void run()
+    return () => { cancelled = true }
+  }, [allowedWards, assignQuery, hasWardRestriction])
+
+  useEffect(() => {
+    if (!assignResults.length) { setAssignFamilyRows([]); return }
+    let cancelled = false
+    const run = async () => {
+      // Use RAW stored epics for the DB lookups (same reason as in load()):
+      // normalized keys would not match voters whose EPIC contains special
+      // characters, causing family members/heads to be skipped.
+      const keys = Array.from(new Set(assignResults.map((v) => ((v.family_head_epic ? v.family_head_epic.trim() : v.epic_no).trim())).filter(Boolean)))
+      const members: Voter[] = []
+      for (const chunk of chunksOf(keys, 100)) {
+        let memberReq = supabase.from('voters').select('*').in('family_head_epic', chunk)
+        if (hasWardRestriction) memberReq = memberReq.in('ward_no', allowedWards)
+        const { data: memberData } = await memberReq
+        if (cancelled) return
+        members.push(...((memberData as Voter[] | null) ?? []))
+
+        let headReq = supabase.from('voters').select('*').in('epic_no', chunk)
+        if (hasWardRestriction) headReq = headReq.in('ward_no', allowedWards)
+        const { data: headData } = await headReq
+        if (cancelled) return
+        members.push(...((headData as Voter[] | null) ?? []))
+      }
+      const seen = new Set<string>()
+      const deduped = members.filter((voter) => {
+        if (seen.has(voter.id)) return false
+        seen.add(voter.id)
+        return true
+      })
+      setAssignFamilyRows(deduped)
+    }
+    void run()
+    return () => { cancelled = true }
+  }, [allowedWards, assignResults, hasWardRestriction])
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => { if (assignRef.current && !assignRef.current.contains(e.target as Node)) setAssignDropdownOpen(false) }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  const assignFamilies = async (familiesToAssign: FamilyGroup[], directVoterByFamilyKey?: Map<string, Voter>) => {
+    if (!leaderId || !familiesToAssign.length) return
+
+    const rowsToInsert: Array<{ team_leader_id: string; voter_id: string; assigned_by: string | null; is_direct: boolean }> = []
+    const seenIds = new Set<string>()
+
+    for (const family of familiesToAssign) {
+      const directVoter = directVoterByFamilyKey?.get(family.key) ?? family.headVoter ?? family.members[0]
+      for (const member of family.members) {
+        if (assignedIds.has(member.id) || seenIds.has(member.id)) continue
+        seenIds.add(member.id)
+        rowsToInsert.push({
+          team_leader_id: leaderId,
+          voter_id: member.id,
+          assigned_by: profile?.id ?? null,
+          is_direct: directVoter ? member.id === directVoter.id : false,
+        })
+      }
+    }
+
+    if (rowsToInsert.length === 0) {
+      toast.error('Selected family is already assigned to this team leader.')
+      return
+    }
+
+    // team_leader_assignments has a UNIQUE constraint on voter_id, so a voter
+    // can belong to only one team leader. Instead of letting the insert fail
+    // with a 409, skip voters already assigned to a different leader and tell
+    // the user how many were skipped.
+    const assignedElsewhere = new Map<string, string>()
+    for (const chunk of chunksOf(rowsToInsert.map((r) => r.voter_id), 150)) {
+      const { data, error } = await supabase
+        .from('team_leader_assignments')
+        .select('voter_id, team_leader_id')
+        .in('voter_id', chunk)
+      if (error) { toast.error(error.message); return }
+      for (const row of (data as Array<{ voter_id: string; team_leader_id: string }> | null) ?? []) {
+        if (row.team_leader_id !== leaderId) assignedElsewhere.set(row.voter_id, row.team_leader_id)
+      }
+    }
+    const skippedElsewhere = assignedElsewhere.size
+    const finalRows = rowsToInsert.filter((r) => !assignedElsewhere.has(r.voter_id))
+
+    if (finalRows.length === 0) {
+      toast.error('Selected family is already assigned to another team leader.')
+      return
+    }
+
+    setAssigning(true)
+    const { error: insertError } = await supabase.from('team_leader_assignments').insert(finalRows)
+    setAssigning(false)
+    if (insertError) { toast.error(insertError.message); return }
+
+    toast.success(
+      `Assigned ${finalRows.length} voter${finalRows.length === 1 ? '' : 's'} from ${familiesToAssign.length} famil${familiesToAssign.length === 1 ? 'y' : 'ies'}${
+        skippedElsewhere ? ` (${skippedElsewhere} skipped - already assigned to another team leader)` : ''
+      }.`,
+    )
+    setAssignQuery('')
+    setAssignResults([])
+    setAssignFamilyRows([])
+    setAssignDropdownOpen(false)
+    setSelectedRemainingFamilyKeys(new Set())
+    await load(true)
+    if (remainingOpen) await loadRemaining()
+    await syncOtherPagesAfterMutation([leaderId])
+  }
+
+  const assignRemainingFamily = async (family: FamilyGroup) => {
+    await assignFamilies([family])
+  }
+
+  const assignSelectedRemainingFamilies = async () => {
+    await assignFamilies(selectedRemainingFamilies)
+  }
+
+  // Move an already-assigned family to this team leader straight from the
+  // assign search results, so no round-trip through the other leader's page is
+  // needed. Mirrors the bulk Transfer modal behaviour.
+  const handleTransferFromAssignSearch = async (family: FamilyGroup, sourceLeaderIds: string[]) => {
+    if (!leaderId) { toast.error('Team leader not found.'); return }
+    setAssignTransferring(true)
+    try {
+      const result = await transferAssignments({
+        voterIds: family.members.map((m) => m.id),
+        fromLeaderIds: sourceLeaderIds,
+        toLeaderId: leaderId,
+        assignedBy: profile?.id ?? null,
+      })
+      if (result.moved === 0) {
+        toast.success('All voters in this family are already assigned to this team leader.')
+        setAssignTransferTarget(null)
+        return
+      }
+      toast.success(`Transferred ${result.moved} voter${result.moved === 1 ? '' : 's'} to ${leaderVoter?.name ?? 'this team leader'}${result.skipped ? ` (${result.skipped} already at target)` : ''}.`)
+      setAssignTransferTarget(null)
+      setAssignQuery('')
+      setAssignResults([])
+      setAssignFamilyRows([])
+      setAssignDropdownOpen(false)
+      await load(true)
+      await syncOtherPagesAfterMutation([leaderId, ...sourceLeaderIds])
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Transfer failed.')
+    } finally {
+      setAssignTransferring(false)
+    }
+  }
+
+  const toggleRemainingFamilySelection = (familyKey: string) => {
+    setSelectedRemainingFamilyKeys((prev) => {
+      const next = new Set(prev)
+      if (next.has(familyKey)) next.delete(familyKey)
+      else next.add(familyKey)
+      return next
+    })
+  }
+
+  const removeAssignment = async (v: Voter) => {
+    if (!leaderId) return
+    // Deleting a voter also removes the whole family - since families are
+    // assigned together, the family members' rows would otherwise be left
+    // behind and stay assigned to this leader.
+    const family = familyForVoter(v)
+    const membersToRemove = family.members.filter((m) => assignedIds.has(m.id))
+    // Always include the voter the user asked to remove. If the family data is
+    // stale or the voter's family group is incomplete (e.g. the family was
+    // broken on the Families page after this page cached the old grouping),
+    // falling back to the whole-family set alone could silently do nothing for
+    // that particular voter.
+    const voterIdsToRemove = Array.from(new Set([
+      ...membersToRemove.map((m) => m.id),
+      ...(assignedIds.has(v.id) ? [v.id] : []),
+    ]))
+    if (!voterIdsToRemove.length) return
+    const { error } = await supabase.from('team_leader_assignments').delete().eq('team_leader_id', leaderId).in('voter_id', voterIdsToRemove)
+    if (error) { toast.error(error.message); return }
+    toast.success(`Removed ${voterIdsToRemove.length} voter${voterIdsToRemove.length === 1 ? '' : 's'} (family of ${v.name}).`)
+    await load(true)
+    await syncOtherPagesAfterMutation([leaderId])
+  }
+
+  const openRemoveModal = (v: Voter) => {
+    const family = familyForVoter(v)
+    const count = family.members.filter((m) => assignedIds.has(m.id)).length
+    setRemoveTargetCount(count)
+    setRemoveTarget(v)
+  }
+
+  const handleTransferConfirm = async (familiesToTransfer: FamilyGroup[], targetLeaderId: string) => {
+    if (!leaderId || !familiesToTransfer.length || !targetLeaderId) return
+    setTransferring(true)
+    try {
+      const votersToMove: Array<{ voter_id: string; is_direct: boolean }> = []
+      const seen = new Set<string>()
+      for (const family of familiesToTransfer) {
+        for (const member of family.members) {
+          if (!assignedIds.has(member.id) || seen.has(member.id)) continue
+          seen.add(member.id)
+          votersToMove.push({ voter_id: member.id, is_direct: directVoterIds.has(member.id) })
+        }
+      }
+      if (votersToMove.length === 0) {
+        toast.error('No assigned voters found in the selected families.')
+        return
+      }
+
+      // Skip voters that are already assigned to the target team leader.
+      const { data: existingAtTarget, error: existingError } = await supabase
+        .from('team_leader_assignments')
+        .select('voter_id')
+        .eq('team_leader_id', targetLeaderId)
+        .in('voter_id', votersToMove.map((v) => v.voter_id))
+      if (existingError) { toast.error(existingError.message); return }
+      const atTarget = new Set((existingAtTarget as { voter_id: string }[] | null)?.map((a) => a.voter_id) ?? [])
+      const rowsToMove = votersToMove.filter((v) => !atTarget.has(v.voter_id))
+      const skipped = votersToMove.length - rowsToMove.length
+
+      if (rowsToMove.length === 0) {
+        toast.success('All selected voters are already assigned to the target team leader.')
+        setTransferOpen(false)
+        return
+      }
+
+      const { error: delError } = await supabase
+        .from('team_leader_assignments')
+        .delete()
+        .eq('team_leader_id', leaderId)
+        .in('voter_id', rowsToMove.map((v) => v.voter_id))
+      if (delError) { toast.error(delError.message); return }
+
+      const { error: insError } = await supabase
+        .from('team_leader_assignments')
+        .insert(rowsToMove.map((v) => ({
+          team_leader_id: targetLeaderId,
+          voter_id: v.voter_id,
+          assigned_by: profile?.id ?? null,
+          is_direct: v.is_direct,
+        })))
+      if (insError) { toast.error(insError.message); return }
+
+      toast.success(
+        `Transferred ${rowsToMove.length} voter${rowsToMove.length === 1 ? '' : 's'} from ${familiesToTransfer.length} famil${familiesToTransfer.length === 1 ? 'y' : 'ies'}${skipped ? ` (${skipped} already at target)` : ''}.`,
+      )
+      setTransferOpen(false)
+      await load(true)
+      await syncOtherPagesAfterMutation([leaderId, targetLeaderId])
+    } finally {
+      setTransferring(false)
+    }
+  }
+
+  const handleChangeLeader = async (newLeader: Voter, partNo: string, section: string) => {
+    if (!leaderId) return
+    setSavingLeader(true)
+    const { error } = await supabase
+      .from('team_leaders')
+      .update({
+        voter_id: newLeader.id,
+        part_no: partNo ? Number(partNo) : null,
+        section: section ? Number(section) : null,
+      })
+      .eq('id', leaderId)
+    setSavingLeader(false)
+    if (error) { toast.error(error.message); return }
+    toast.success(`${newLeader.name} is now the team leader.`)
+    setChangeLeaderOpen(false)
+    await load(true)
+    await syncOtherPagesAfterMutation([leaderId])
+  }
+
+  const handleChangePrimary = async (family: FamilyGroup, memberId: string) => {
+    if (!leaderId) return
+    const memberIds = family.members.filter((m) => assignedIds.has(m.id)).map((m) => m.id)
+    if (!memberIds.length) return
+    setSavingPrimary(true)
+    try {
+      const { error: clearError } = await supabase
+        .from('team_leader_assignments')
+        .update({ is_direct: false })
+        .eq('team_leader_id', leaderId)
+        .in('voter_id', memberIds)
+      if (clearError) { toast.error(clearError.message); return }
+      const { error: setError } = await supabase
+        .from('team_leader_assignments')
+        .update({ is_direct: true })
+        .eq('team_leader_id', leaderId)
+        .eq('voter_id', memberId)
+      if (setError) { toast.error(setError.message); return }
+      const member = family.members.find((m) => m.id === memberId)
+      toast.success(member ? `${member.name} is now the primary member.` : 'Primary member updated.')
+      setPrimaryTarget(null)
+      await load(true)
+      await syncOtherPagesAfterMutation([leaderId])
+    } finally {
+      setSavingPrimary(false)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="space-y-5 pb-10">
+        <Link to={`/team-leaders${leaderListQuery}`} className="inline-flex items-center gap-1.5 text-sm font-semibold text-slate-500 transition hover:text-brand-600">
+          <ArrowLeft className="h-4 w-4" /> Back to Team Leaders
+        </Link>
+        <div className="flex items-center justify-center rounded-3xl border border-slate-200 bg-white px-6 py-16 text-sm text-slate-500 shadow-soft">
+          <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading team leader...
+        </div>
+      </div>
+    )
+  }
+
+  if (!leader) {
+    return (
+      <div className="space-y-5 pb-10">
+        <Link to={`/team-leaders${leaderListQuery}`} className="inline-flex items-center gap-1.5 text-sm font-semibold text-slate-500 transition hover:text-brand-600">
+          <ArrowLeft className="h-4 w-4" /> Back to Team Leaders
+        </Link>
+        <div className="rounded-3xl border border-slate-200 bg-white px-6 py-16 text-center text-sm text-slate-500 shadow-soft">
+          Team leader not found.
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-5 pb-10">
+      <Link to={`/team-leaders${leaderListQuery}`} className="inline-flex items-center gap-1.5 text-sm font-semibold text-slate-500 transition hover:text-brand-600">
+        <ArrowLeft className="h-4 w-4" /> Back to Team Leaders
+      </Link>
+
+      <PageHeader
+        title={isOfficeLeader(leader) ? 'Office' : isShiftedLeader(leader) ? 'Shifted' : (leaderVoter?.name ?? 'Team Leader')}
+        description={isOfficeLeader(leader)
+          ? 'Voters and families parked under the office (no field team leader).'
+          : isShiftedLeader(leader)
+            ? 'Voters and families moved out of field assignment (single voters live under Office instead).'
+            : `EPIC ${leaderVoter?.epic_no ?? '-'}${leader.part_no != null ? ` · Part ${leader.part_no}` : ''}${leader.section != null ? ` · Section ${leader.section}` : ''}${leader.notes ? ` · ${leader.notes}` : ''}`}
+        action={
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                title="Previous team leader"
+                disabled={!prevLeaderId}
+                onClick={() => { if (prevLeaderId) navigate(`/team-leaders/${prevLeaderId}${leaderListQuery}`) }}
+                className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                title="Next team leader"
+                disabled={!nextLeaderId}
+                onClick={() => { if (nextLeaderId) navigate(`/team-leaders/${nextLeaderId}${leaderListQuery}`) }}
+                className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="relative">
+              <select
+                value={leaderId ?? ''}
+                onChange={(e) => { const id = e.target.value; if (id) navigate(`/team-leaders/${id}${leaderListQuery}`) }}
+                className="h-10 appearance-none rounded-xl border border-slate-200 bg-white pl-3 pr-8 text-sm font-semibold text-slate-700 outline-none focus:border-brand-300 focus:ring-2 focus:ring-brand-100"
+              >
+                {leaderList.map((tl) => (
+                  <option key={tl.id} value={tl.id}>
+                    {isOfficeLeader(tl) ? 'Office' : isShiftedLeader(tl) ? 'Shifted' : `${tl.part_no != null ? `Part ${tl.part_no}` : 'Part -'}${tl.section != null ? ` · Section ${tl.section}` : ''}`}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+            </div>
+            {!isOfficeLeader(leader) && !isShiftedLeader(leader) && (
+              <button
+                type="button"
+                onClick={() => setChangeLeaderOpen(true)}
+                className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-700 transition hover:bg-slate-100"
+              >
+                <UserCog className="h-4 w-4" /> Change Leader
+              </button>
+            )}
+          </div>
+        }
+      />
+
+      <section className="grid grid-cols-2 gap-4 md:grid-cols-4">
+        <div className="rounded-2xl border border-brand-100 bg-brand-50/50 p-4">
+          <p className="text-xs font-semibold uppercase tracking-wider text-brand-600">Assigned Families</p>
+          <p className="mt-1 text-2xl font-bold text-slate-900">{visibleFamilies.length}</p>
+        </div>
+        <div className="rounded-2xl border border-emerald-100 bg-emerald-50/50 p-4">
+          <p className="text-xs font-semibold uppercase tracking-wider text-emerald-600">Total Family Members</p>
+          <p className="mt-1 text-2xl font-bold text-slate-900">{totalMembers}</p>
+        </div>
+        <div className="rounded-2xl border border-blue-100 bg-blue-50/50 p-4">
+          <p className="text-xs font-semibold uppercase tracking-wider text-blue-600">Male Assigned</p>
+          <p className="mt-1 text-2xl font-bold text-slate-900">{maleCount}</p>
+        </div>
+        <div className="rounded-2xl border border-purple-100 bg-purple-50/50 p-4">
+          <p className="text-xs font-semibold uppercase tracking-wider text-purple-600">Female Assigned</p>
+          <p className="mt-1 text-2xl font-bold text-slate-900">{femaleCount}</p>
+        </div>
+      </section>
+
+      <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-soft">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold text-slate-900">Family Size Dashboard</h2>
+            <p className="text-xs text-slate-500">Click a size to highlight those families in the assigned voters table below.</p>
+          </div>
+          {familySizeFilter != null && (
+            <button
+              type="button"
+              onClick={() => setFamilySizeFilter(null)}
+              className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 transition hover:bg-slate-100"
+            >
+              <X className="h-3.5 w-3.5" /> Clear Filter
+            </button>
+          )}
+        </div>
+        {familySizeDistribution.length === 0 ? (
+          <p className="mt-4 text-sm text-slate-500">No families assigned yet.</p>
+        ) : (
+          <div className="mt-4 flex flex-wrap gap-2">
+            {familySizeDistribution.map(([size, count]) => {
+              const active = familySizeFilter === size
+              return (
+                <button
+                  key={size}
+                  type="button"
+                  onClick={() => setFamilySizeFilter(active ? null : size)}
+                  className={`flex items-center gap-2 rounded-2xl border px-4 py-2.5 text-left transition ${
+                    active
+                      ? 'border-brand-400 bg-brand-50 ring-2 ring-brand-200'
+                      : 'border-slate-200 bg-white hover:border-brand-300 hover:bg-brand-50/50'
+                  }`}
+                >
+                  <span className={`text-sm font-bold ${active ? 'text-brand-800' : 'text-slate-900'}`}>
+                    {size === 1 ? 'Single' : `${size} Members`}
+                  </span>
+                  <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${active ? 'bg-brand-100 text-brand-800' : 'bg-slate-100 text-slate-600'}`}>
+                    {count}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-soft">
+        <h2 className="text-base font-semibold text-slate-900">Assign a Voter</h2>
+        <p className="text-xs text-slate-500">Search for a voter - their entire family is assigned together. Picking another voter from the same family is skipped automatically.</p>
+        <div ref={assignRef} className="relative mt-4">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+            <input
+              className="h-11 w-full rounded-xl border border-slate-200 bg-white pl-10 pr-10 text-sm outline-none transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100"
+              placeholder="Search by name, EPIC, relative name, mobile, house number..."
+              value={assignQuery}
+              onChange={(e) => { setAssignQuery(e.target.value); if (!assignDropdownOpen) setAssignDropdownOpen(true) }}
+              onFocus={() => { if (assignQuery.trim()) setAssignDropdownOpen(true) }}
+            />
+            {assignQuery && (
+              <button type="button" onClick={() => { setAssignQuery(''); setAssignResults([]) }}
+                className="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600" aria-label="Clear search">
+                <X className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+
+          {assignDropdownOpen && assignQuery.trim() && assignSearching && (
+            <div className="absolute z-20 mt-2 w-full rounded-2xl border border-slate-200 bg-white p-4 shadow-soft">
+              <div className="flex items-center justify-center gap-2 text-sm text-slate-500"><Loader2 className="h-4 w-4 animate-spin" /> Searching...</div>
+            </div>
+          )}
+
+          {assignDropdownOpen && assignQuery.trim() && !assignSearching && assignResultFamilies.length > 0 && (
+            <div className="absolute z-20 mt-2 w-full max-h-[70vh] overflow-y-auto rounded-2xl border border-slate-200 bg-white p-3 shadow-soft">
+              <div className="space-y-3">
+                {assignResultFamilies.map((family) => {
+                  const head = family.headVoter ?? family.members[0]
+                  const alreadyAssigned = family.members.every((member) => assignedIds.has(member.id))
+                  const matchedMember = family.members.find((member) => assignResults.some((result) => result.id === member.id)) ?? head
+                  const otherLeaderIds = Array.from(new Set(
+                    family.members.map((m) => voterToLeaderId[m.id]).filter((id): id is string => Boolean(id) && id !== leaderId),
+                  ))
+                  const otherLeaderName = otherLeaderIds.length === 1 ? leaderNameById[otherLeaderIds[0]] : undefined
+                  const fullyAssignedElsewhere = family.members.length > 0 && otherLeaderIds.length > 0 && family.members.every((m) => voterToLeaderId[m.id] && voterToLeaderId[m.id] !== leaderId)
+                  const currentLeaderName = leaderVoter?.name ?? (leaderId ? leaderNameById[leaderId] : undefined)
+                  return (
+                    <div key={family.key} className={`rounded-2xl border border-slate-200 p-4 ${alreadyAssigned ? 'opacity-60' : ''}`}>
+                      <div className="flex items-start gap-3">
+                        {head && <VoterAvatar voter={head} photoUrl={resolvePhotoUrl(head)} />}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="truncate text-sm font-semibold text-slate-900">{highlightMatch(head?.name ?? 'Unknown head', assignTokens)}</p>
+                            <span className="inline-flex rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
+                              {family.members.length} member{family.members.length === 1 ? '' : 's'}
+                            </span>
+                            {alreadyAssigned && (
+                              currentLeaderName ? (
+                                <span className="inline-flex rounded-full bg-brand-50 px-2 py-0.5 text-[10px] font-semibold text-brand-700">Already assigned to {currentLeaderName}</span>
+                              ) : (
+                                <span className="inline-flex rounded-full bg-brand-50 px-2 py-0.5 text-[10px] font-semibold text-brand-700">Already assigned</span>
+                              )
+                            )}
+                            {fullyAssignedElsewhere && (
+                              otherLeaderName ? (
+                                <span className="inline-flex rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">Already assigned to {otherLeaderName}</span>
+                              ) : (
+                                <span className="inline-flex rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">Already assigned</span>
+                              )
+                            )}
+                          </div>
+                          <p className="mt-0.5 truncate text-xs text-slate-500">
+                            EPIC: {highlightMatch(head?.epic_no ?? '-', assignTokens)} · Part {head?.part_no ?? '-'} / Sec {head?.section ?? '-'}{head?.house_no ? ` · House ${head.house_no}` : ''}
+                          </p>
+                          {matchedMember?.id !== head?.id && (
+                            <p className="mt-1 text-[11px] text-brand-600">Matched: {highlightMatch(matchedMember.name, assignTokens)} ({matchedMember.epic_no})</p>
+                          )}
+                        </div>
+                        {fullyAssignedElsewhere ? (
+                          <button
+                            type="button"
+                            disabled={assignTransferring || !leaderId}
+                            onClick={() => setAssignTransferTarget({ family, sourceLeaderIds: otherLeaderIds })}
+                            className="inline-flex h-9 flex-shrink-0 items-center gap-1.5 rounded-lg bg-amber-600 px-3 text-xs font-semibold text-white transition hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {assignTransferring ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowLeftRight className="h-3.5 w-3.5" />} Transfer
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={alreadyAssigned || assigning}
+                            onClick={() => void assignFamilies([family], new Map([[family.key, matchedMember ?? head]]))}
+                            className="inline-flex h-9 flex-shrink-0 items-center gap-1.5 rounded-lg bg-slate-900 px-3 text-xs font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {assigning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <UserPlus className="h-3.5 w-3.5" />} Assign
+                          </button>
+                        )}
+                      </div>
+                      <div className="mt-3 space-y-1.5 border-t border-slate-100 pt-3">
+                        {family.members.map((member) => (
+                          <div key={member.id} className="flex items-center gap-2">
+                            <VoterAvatar voter={member} photoUrl={resolvePhotoUrl(member)} size="sm" />
+                            <span className="min-w-0 flex-1 truncate text-xs text-slate-600">{highlightMatch(member.name, assignTokens)}</span>
+                            <span className="truncate text-[11px] text-slate-400">{highlightMatch(member.epic_no, assignTokens)}</span>
+                            <IconButton title="View voter" onClick={() => setSelectedVoter(member)}>
+                              <Eye className="h-3.5 w-3.5" />
+                            </IconButton>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {assignDropdownOpen && assignQuery.trim() && !assignSearching && assignResults.length === 0 && (
+            <div className="absolute z-20 mt-2 w-full rounded-2xl border border-slate-200 bg-white p-4 text-center text-sm text-slate-500 shadow-soft">
+              No voters found.
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-soft">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
+          <div>
+            <h2 className="text-base font-semibold text-slate-900">Assigned Voters</h2>
+            <p className="text-xs text-slate-500">
+              {showFamilyMembers
+                ? `${totalMembers} member${totalMembers === 1 ? '' : 's'} across ${visibleFamilies.length} famil${visibleFamilies.length === 1 ? 'y' : 'ies'}`
+                : `${sortedHeads.length} added voter${sortedHeads.length === 1 ? '' : 's'} (expand a row to see its family)`}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+              <input
+                className="h-9 w-56 rounded-lg border border-slate-200 bg-white pl-8 pr-8 text-xs outline-none transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100"
+                placeholder="Search assigned voters..."
+                value={query}
+                onChange={(e) => { setQuery(e.target.value); setPage(1) }}
+              />
+              {query && (
+                <button type="button" onClick={() => { setQuery(''); setPage(1) }}
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded-md p-0.5 text-slate-400 hover:text-slate-600" aria-label="Clear search">
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+            {isSpecialLeaderView && (
+              <>
+                <select
+                  className="h-9 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 outline-none"
+                  aria-label="Filter by part"
+                  title="Filter by part"
+                  value={detailPartFilter}
+                  onChange={(e) => { setDetailPartFilter(e.target.value); setDetailSectionFilter(''); setPage(1) }}
+                >
+                  <option value="">All Parts</option>
+                  {detailPartOptions.map((p) => (
+                    <option key={p} value={String(p)}>Part {p}</option>
+                  ))}
+                </select>
+                <select
+                  className="h-9 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 outline-none disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-slate-400"
+                  aria-label="Filter by section"
+                  title={detailPartFilter ? 'Filter by section' : 'Select a part to filter by section'}
+                  value={detailSectionFilter}
+                  disabled={!detailPartFilter}
+                  onChange={(e) => { setDetailSectionFilter(e.target.value); setPage(1) }}
+                >
+                  <option value="">All Sections</option>
+                  {detailSectionOptions.map((s) => (
+                    <option key={s} value={String(s)}>Section {s}</option>
+                  ))}
+                </select>
+                <select
+                  className="h-9 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 outline-none"
+                  aria-label="Filter by religion"
+                  title="Filter by religion"
+                  value={detailReligionFilter}
+                  onChange={(e) => { setDetailReligionFilter(e.target.value); setPage(1) }}
+                >
+                  <option value="">All Religions</option>
+                  {detailReligionOptions.map((r) => (
+                    <option key={r} value={r}>{r}</option>
+                  ))}
+                </select>
+                <select
+                  className="h-9 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 outline-none"
+                  aria-label="Filter by state"
+                  title="Filter by state"
+                  value={detailStateFilter}
+                  onChange={(e) => { setDetailStateFilter(e.target.value); setPage(1) }}
+                >
+                  <option value="">All States</option>
+                  {detailStateOptions.map((s) => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+                {(detailPartFilter || detailSectionFilter || detailReligionFilter || detailStateFilter) && (
+                  <button
+                    type="button"
+                    onClick={() => { setDetailPartFilter(''); setDetailSectionFilter(''); setDetailReligionFilter(''); setDetailStateFilter(''); setPage(1) }}
+                    className="inline-flex h-9 items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-500 transition hover:bg-slate-100"
+                  >
+                    <X className="h-3.5 w-3.5" /> Clear
+                  </button>
+                )}
+              </>
+            )}
+            <button
+              type="button"
+              onClick={() => { setShowFamilyMembers((v) => !v); setPage(1) }}
+              className={`inline-flex h-9 items-center gap-1.5 rounded-lg border px-3 text-xs font-semibold transition ${
+                showFamilyMembers
+                  ? 'border-brand-200 bg-brand-50 text-brand-700'
+                  : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-100'
+              }`}
+            >
+              <Users className="h-3.5 w-3.5" /> {showFamilyMembers ? 'Show Added Voters' : 'Show Families'}
+            </button>
+            <ColumnsDropdown visible={visibleColumns} onChange={setVisibleColumns} />
+            {Object.keys(columnWidths).length > 0 && (
+              <button
+                type="button"
+                onClick={() => setColumnWidths({})}
+                title="Reset column widths to default"
+                className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 transition hover:bg-slate-100"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => openModalFor('export')}
+              className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-100"
+            >
+              <Download className="h-3.5 w-3.5" /> Export
+            </button>
+            <button
+              type="button"
+              onClick={() => setTransferOpen(true)}
+              className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-100"
+            >
+              <ArrowLeftRight className="h-3.5 w-3.5" /> Transfer
+            </button>
+            <button
+              type="button"
+              onClick={() => openModalFor('print')}
+              className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-slate-900 px-3 text-xs font-semibold text-white transition hover:bg-slate-800"
+            >
+              <Printer className="h-3.5 w-3.5" /> Print / PDF
+            </button>
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="min-w-full border-separate border-spacing-0 text-sm">
+            <thead className="bg-slate-50">
+              <tr>
+                {MEMBER_COLUMNS.filter((c) => visibleColumns.includes(c.key)).map((col) => (
+                  <th
+                    key={col.key}
+                    style={columnWidths[col.key] != null ? { width: columnWidths[col.key] } : undefined}
+                    className={`group relative border-b border-slate-200 px-5 py-3 text-left text-[11px] font-semibold uppercase tracking-wider text-slate-500 ${col.headerClass ?? ''} ${col.sortable ? 'cursor-pointer select-none hover:text-brand-600' : ''}`}
+                    onClick={col.sortable ? () => toggleSort(col.key) : undefined}
+                  >
+                    <span className="inline-flex items-center gap-1">
+                      {col.label}
+                      {sortKey === col.key ? (sortDir === 'asc' ? <ChevronsUp className="h-3.5 w-3.5" /> : <ChevronsDown className="h-3.5 w-3.5" />) : null}
+                    </span>
+                    <ColumnResizeHandle columnKey={col.key} onResize={(key, width) => {
+                      if (width === DEFAULT_COLUMN_WIDTHS[key]) {
+                        setColumnWidths((prev) => {
+                          const next = { ...prev }
+                          delete next[key]
+                          return next
+                        })
+                      } else {
+                        setColumnWidths((prev) => ({ ...prev, [key]: width }))
+                      }
+                    }} />
+                  </th>
+                ))}
+                <th className="border-b border-slate-200 px-5 py-3 text-right text-[11px] font-semibold uppercase tracking-wider text-slate-500">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pageHeads.map((head, rowIndex) => {
+                const family = familyForVoter(head)
+                const familyKey = normalizeLookupValue(family.head) || `voter:${head.id}`
+                const expanded = expandedFamilyKeys.has(familyKey)
+                const isHeadRow = !showFamilyMembers || family.headVoter === head
+                const memberRows = showFamilyMembers
+                  ? family.members.filter((m) => m.id !== head.id)
+                  : (isHeadRow && expanded ? family.members.filter((m) => m.id !== head.id) : [])
+                const sizeHighlighted = familySizeFilter != null && family.members.length === familySizeFilter
+                return (
+                  <Fragment key={head.id}>
+                    <tr className={`group transition hover:bg-slate-50 ${sizeHighlighted ? 'bg-brand-50/60' : ''}`}>
+                      {renderVoterCells(head, family, pageStartIndex + rowIndex + 1, false)}
+                      <td className="border-b border-slate-100 px-5 py-3.5">
+                        <div className="flex items-center justify-end gap-1.5">
+                          {!showFamilyMembers && isHeadRow && family.members.length > 1 && (
+                            <IconButton
+                              title={expanded ? 'Hide family members' : 'Show family members'}
+                              onClick={() => toggleFamilyExpand(familyKey)}
+                            >
+                              {expanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                            </IconButton>
+                          )}
+                          <IconButton title="View voter" onClick={() => setSelectedVoter(head)}>
+                            <Eye className="h-4 w-4" />
+                          </IconButton>
+                          {(() => {
+                            const contact = resolveContact(head, family)
+                            if (!contact.number) return null
+                            const viaName = contact.ownerName && contact.ownerName !== vf(head, 'name') ? ` (via ${contact.ownerName})` : ''
+                            return (
+                              <IconButton title={`Call${viaName}`} onClick={() => { window.location.href = `tel:${contact.number}` }}>
+                                <Phone className="h-4 w-4" />
+                              </IconButton>
+                            )
+                          })()}
+                          <MoreMenu>
+                            {(close) => (
+                              <>
+                                {family.members.filter((m) => assignedIds.has(m.id)).length > 1 && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => { e.stopPropagation(); close(); setPrimaryTarget(family) }}
+                                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-100"
+                                  >
+                                    <UserCog className="h-3.5 w-3.5" /> Set primary member
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={(e) => { e.stopPropagation(); close(); openRemoveModal(head) }}
+                                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm text-rose-600 transition hover:bg-rose-50"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" /> Remove assignment
+                                </button>
+                              </>
+                            )}
+                          </MoreMenu>
+                        </div>
+                      </td>
+                    </tr>
+                    {memberRows.map((member) => (
+                      <tr key={member.id} className="group bg-slate-50/70 transition hover:bg-slate-50">
+                        {renderVoterCells(member, family, null, true)}
+                        <td className="border-b border-slate-100 px-5 py-3.5">
+                          <div className="flex items-center justify-end gap-1.5">
+                            <IconButton title="View voter" onClick={() => setSelectedVoter(member)}>
+                              <Eye className="h-4 w-4" />
+                            </IconButton>
+                            {(() => {
+                              const contact = resolveContact(member, family)
+                              if (!contact.number) return null
+                              const viaName = contact.ownerName && contact.ownerName !== vf(member, 'name') ? ` (via ${contact.ownerName})` : ''
+                              return (
+                                <IconButton title={`Call${viaName}`} onClick={() => { window.location.href = `tel:${contact.number}` }}>
+                                  <Phone className="h-4 w-4" />
+                                </IconButton>
+                              )
+                            })()}
+                            <MoreMenu>
+                              {(close) => (
+                                <>
+                                  {family.members.filter((m) => assignedIds.has(m.id)).length > 1 && (
+                                    <button
+                                      type="button"
+                                      onClick={(e) => { e.stopPropagation(); close(); setPrimaryTarget(family) }}
+                                      className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-100"
+                                    >
+                                      <UserCog className="h-3.5 w-3.5" /> Set primary member
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={(e) => { e.stopPropagation(); close(); openRemoveModal(member) }}
+                                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm text-rose-600 transition hover:bg-rose-50"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" /> Remove assignment
+                                  </button>
+                                </>
+                              )}
+                            </MoreMenu>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </Fragment>
+                )
+              })}
+            </tbody>
+          </table>
+          {pageHeads.length === 0 && (
+            <div className="px-6 py-16 text-center text-sm text-slate-500">
+              No assigned voters yet. Search above to assign voters to this team leader.
+            </div>
+          )}
+        </div>
+
+        {sortedHeads.length > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 px-5 py-3">
+            <span className="text-xs text-slate-500">
+              {sortedHeads.length} voter{sortedHeads.length === 1 ? '' : 's'} · Page {currentPage} of {pageCount}
+            </span>
+            <div className="flex items-center gap-1.5">
+              <IconButton title="Previous page" onClick={() => setPage(currentPage - 1)} disabled={currentPage <= 1}>
+                <ChevronLeft className="h-4 w-4" />
+              </IconButton>
+              <IconButton title="Next page" onClick={() => setPage(currentPage + 1)} disabled={currentPage >= pageCount}>
+                <ChevronRight className="h-4 w-4" />
+              </IconButton>
+              <select
+                className="h-9 rounded-lg border border-slate-200 bg-white px-2 text-xs font-semibold text-slate-600 outline-none"
+                value={pageSize}
+                onChange={(e) => { setPageSize(Number(e.target.value)); setPage(1) }}
+              >
+                {PAGE_SIZE_OPTIONS.map((n) => (
+                  <option key={n} value={n}>{n} per page</option>
+                ))}
+              </select>
+            </div>
+          </div>
+        )}
+      </section>
+
+      {!isOfficeLeader(leader) && !isShiftedLeader(leader) && (
+        <section className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-soft">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
+            <div>
+              <h2 className="text-base font-semibold text-slate-900">Remaining Families</h2>
+              <p className="text-xs text-slate-500">
+                Families in Part {leader.part_no ?? '-'}{leader.section != null ? ` / Section ${leader.section}` : ''} not yet assigned to any team leader.
+              </p>
+            </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {remainingOpen && remainingFamilies.length > 0 && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setSelectedRemainingFamilyKeys((prev) => prev.size === remainingFamilies.length ? new Set() : new Set(remainingFamilies.map((family) => family.key)))}
+                  className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-100"
+                >
+                  {selectedRemainingFamilyKeys.size === remainingFamilies.length ? 'Clear Selection' : 'Select All'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void assignSelectedRemainingFamilies()}
+                  disabled={assigning || selectedRemainingFamilies.length === 0}
+                  className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-slate-900 px-3 text-xs font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {assigning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <UserPlus className="h-3.5 w-3.5" />} Assign Selected
+                </button>
+              </>
+            )}
+            <button
+              type="button"
+              onClick={() => void loadRemaining()}
+              disabled={remainingLoading}
+              className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-100 disabled:opacity-60"
+            >
+              {remainingLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCcw className="h-3.5 w-3.5" />}
+              {remainingLoading ? 'Loading...' : remainingOpen ? 'Refresh' : 'Show Remaining'}
+            </button>
+          </div>
+        </div>
+
+        {remainingOpen && (
+          remainingLoading ? (
+            <div className="flex items-center justify-center px-6 py-16 text-sm text-slate-500"><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading remaining families...</div>
+          ) : remainingFamilies.length === 0 ? (
+            <div className="px-6 py-16 text-center text-sm text-slate-500">
+              {leader.part_no == null
+                ? 'This team leader has no part assigned yet, so remaining families cannot be computed.'
+                : 'All families in this part/section are already assigned to a team leader.'}
+            </div>
+          ) : (
+            <div className="p-5">
+              <p className="mb-4 text-xs text-slate-500">
+                {remainingFamilies.length} remaining famil{remainingFamilies.length === 1 ? 'y' : 'ies'} · {remainingRows.length} voters
+              </p>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+                {remainingFamilies.map((family) => {
+                  const head = family.headVoter ?? family.members[0] ?? null
+                  const selected = selectedRemainingFamilyKeys.has(family.key)
+                  return (
+                    <div key={family.key} className={`rounded-2xl border p-4 transition ${selected ? 'border-brand-400 bg-brand-50/60 ring-2 ring-brand-100' : 'border-slate-200'}`}>
+                      <div className="flex items-center gap-3">
+                        <CheckboxUI checked={selected} onChange={() => toggleRemainingFamilySelection(family.key)} />
+                        {head && (
+                          head.photo_url ? (
+                            <VoterAvatar voter={head} photoUrl={resolvePhotoUrl(head)} />
+                          ) : (
+                            <span className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-brand-100 font-semibold text-brand-700">
+                              {head ? initials(head.name) : '?'}
+                            </span>
+                          )
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-semibold text-slate-900">{head?.name ?? 'Unknown head'}</p>
+                          <p className="truncate text-xs text-slate-500">
+                            {head?.epic_no ? `EPIC: ${head.epic_no} · ` : ''}Part {head?.part_no ?? '-'} / Sec {head?.section ?? '-'}
+                          </p>
+                        </div>
+                        <div className="flex flex-shrink-0 flex-col items-end gap-2">
+                          <span className="inline-flex items-center rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-700">
+                            {family.members.length} member{family.members.length === 1 ? '' : 's'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => void assignRemainingFamily(family)}
+                            disabled={assigning}
+                            className="inline-flex h-8 items-center gap-1 rounded-lg bg-slate-900 px-2.5 text-[11px] font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {assigning ? <Loader2 className="h-3 w-3 animate-spin" /> : <UserPlus className="h-3 w-3" />} Assign
+                          </button>
+                        </div>
+                      </div>
+                      <div className="mt-3 space-y-1.5 border-t border-slate-100 pt-3">
+                        {family.members.map((m) => (
+                          <div key={m.id} className="flex items-center gap-2">
+                            {m.photo_url ? (
+                              <VoterAvatar voter={m} photoUrl={resolvePhotoUrl(m)} size="sm" />
+                            ) : (
+                              <span className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-brand-100 text-[9px] font-semibold text-brand-700">
+                                {initials(m.name)}
+                              </span>
+                            )}
+                            <span className="min-w-0 flex-1 truncate text-xs text-slate-600">{m.name}</span>
+                            <span className="truncate text-[11px] text-slate-400">{m.epic_no}</span>
+                            <IconButton title="View voter" onClick={() => setSelectedVoter(m)}>
+                              <Eye className="h-3.5 w-3.5" />
+                            </IconButton>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )
+        )}
+      </section>
+      )}
+
+      <ChangeLeaderModal
+        open={changeLeaderOpen}
+        currentLeader={leader}
+        hasWardRestriction={hasWardRestriction}
+        allowedWards={allowedWards}
+        saving={savingLeader}
+        onClose={() => setChangeLeaderOpen(false)}
+        onConfirm={(newLeader, partNo, section) => void handleChangeLeader(newLeader, partNo, section)}
+      />
+
+      <TransferFamiliesModal
+        open={transferOpen}
+        currentLeaderId={leaderId}
+        families={visibleFamilies}
+        assignedIds={assignedIds}
+        transferring={transferring}
+        resolvePhotoUrl={resolvePhotoUrl}
+        onClose={() => setTransferOpen(false)}
+        onConfirm={(familiesToTransfer, targetLeaderId) => void handleTransferConfirm(familiesToTransfer, targetLeaderId)}
+      />
+
+      <TransferFamilyConfirmModal
+        open={assignTransferTarget !== null}
+        headName={assignTransferTarget?.family.headVoter?.name ?? assignTransferTarget?.family.members[0]?.name ?? 'Unknown head'}
+        memberCount={assignTransferTarget?.family.members.length ?? 0}
+        sourceLeaderName={assignTransferTarget && assignTransferTarget.sourceLeaderIds.length === 1 ? leaderNameById[assignTransferTarget.sourceLeaderIds[0]] : undefined}
+        targetLeaderName={leaderVoter?.name ?? (leaderId ? leaderNameById[leaderId] : undefined) ?? 'this team leader'}
+        transferring={assignTransferring}
+        onClose={() => setAssignTransferTarget(null)}
+        onConfirm={() => {
+          if (!assignTransferTarget) return
+          void handleTransferFromAssignSearch(assignTransferTarget.family, assignTransferTarget.sourceLeaderIds)
+        }}
+      />
+
+      <ReportConfigModal
+        title="Assigned Voters"
+        open={modalOpen}
+        mode={modalMode}
+        fieldDefs={PRINT_FIELD_DEFS}
+        fields={printFields.map((f) => ({ key: f.key, enabled: f.enabled }))}
+        defaultFields={DEFAULT_PRINT_FIELDS.map((f) => ({ key: f.key, enabled: f.enabled }))}
+        showLayout
+        layout={includeFamilyMembers}
+        layoutTrueLabel="Detailed - family head + all members"
+        layoutFalseLabel="Family heads only"
+        fontSize={printFontSize}
+        boldText={printBold}
+        exportBorders={exportBorders}
+        exportRowHeight={exportRowHeight}
+        exportColWidth={exportColWidth}
+        printDescription="Select columns and layout once. Download PDF saves the file immediately; Open print preview lets you choose a printer or Save as PDF."
+        printActionLabel="Open print preview"
+        onClose={() => setModalOpen(false)}
+        onConfirm={handleModalConfirm}
+        onDownloadPdf={modalMode === 'print' ? handlePdfDownload : undefined}
+      />
+
+      <RemoveAssignmentModal
+        voter={removeTarget}
+        voterCount={removeTargetCount}
+        onClose={() => setRemoveTarget(null)}
+        onConfirm={async () => {
+          if (!removeTarget) return
+          await removeAssignment(removeTarget)
+          setRemoveTarget(null)
+        }}
+      />
+
+      <ChangePrimaryVoterModal
+        open={primaryTarget !== null}
+        family={primaryTarget}
+        assignedIds={assignedIds}
+        directVoterIds={directVoterIds}
+        saving={savingPrimary}
+        resolvePhotoUrl={resolvePhotoUrl}
+        onClose={() => setPrimaryTarget(null)}
+        onConfirm={(family, memberId) => void handleChangePrimary(family, memberId)}
+      />
+
+      <VoterDetailDrawer
+        voter={selectedVoter}
+        onClose={() => setSelectedVoter(null)}
+        onSaved={async () => { await load(true) }}
+      />
+    </div>
+  )
+}
