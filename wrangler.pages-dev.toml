@@ -1,0 +1,20 @@
+name = "voterdata-management"
+compatibility_date = "2026-07-04"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+VITE_APP_NAME = "VoterData Management"
+APP_ORIGIN = "http://localhost:8788"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "voterdata"
+database_id = "bcf9ed27-9957-4868-9722-1597d6b15551"
+
+[[r2_buckets]]
+binding = "PHOTOS"
+bucket_name = "voter-photos"
+
+[[r2_buckets]]
+binding = "IMPORT_TEMP"
+bucket_name = "import-temp"

@@ -1,0 +1,7 @@
+/assets/* /assets/:splat 200
+/assets/* /404.html 404
+/manifest.webmanifest /manifest.webmanifest 200
+/manifest.webmanifest /404.html 404
+/sw.js /sw.js 200
+/sw.js /404.html 404
+/* /index.html 200

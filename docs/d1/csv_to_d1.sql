@@ -1,0 +1,41 @@
+-- Load converted CSV into D1 AFTER 001_schema.sql.
+-- wrangler cannot ingest CSV directly. Convert CSV to INSERT SQL first
+-- (see docs/SUPABASE_TO_CLOUDFLARE_MIGRATION.md) or use:
+--
+--   npx wrangler d1 execute voterdata --remote --command="INSERT INTO ..."
+--
+-- Load order respects foreign keys. Skip 001_schema.sql's sentinel
+-- team_leaders INSERTs if you are importing real team_leaders rows.
+
+-- Example (do not run as-is; generated files live in docs/d1/seed/):
+
+-- .mode csv
+-- .import exports/users.csv users
+--
+-- SQLite CLI .import works locally. For remote D1 use wrangler + SQL files.
+
+-- Recommended local path:
+--   1. wrangler d1 execute voterdata --local --file=docs/d1/001_schema.sql
+--   2. sqlite3 .wrangler/state/v3/d1/.../db.sqlite
+--      .mode csv
+--      .import exports/users.csv users
+--      ...repeat in FK order...
+--   3. wrangler d1 export / import to remote, or re-run INSERT files remotely.
+
+-- Foreign-key load order:
+--   users
+--   voters
+--   activity_logs
+--   import_batches
+--   custom_fields
+--   custom_field_values
+--   saved_filter_presets
+--   family_merge_events
+--   groups
+--   group_members
+--   team_leaders          (import BEFORE creating sentinel rows)
+--   team_leader_assignments
+--   meetings
+--   meeting_invitees
+--   job_records
+--   then 002_fts_triggers.sql (rebuild)
