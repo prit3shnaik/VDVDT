@@ -1,8 +1,15 @@
--- Better Auth core tables (email/password + admin plugin) for Cloudflare D1.
--- Apply:
---   npx wrangler d1 execute voterdata --remote --file=./docs/d1/004_better_auth_schema.sql
--- These are separate from the app's `users` profile table (role/allowed_wards/can_edit).
--- `users.auth_user_id` points at `user.id` here.
+-- ===========================================================================
+-- 004_better_auth_schema.sql — superseded by 000_platform.sql
+--
+-- Better Auth tables are platform-global and now live in the platform database.
+-- 000_platform.sql creates them together with orgs/workspaces/memberships, so a
+-- fresh install applies 000_platform.sql only.
+--
+-- This file is kept for existing deployment runbooks and is safe to re-run: it
+-- is the same idempotent DDL. Apply it to PLATFORM_DB, never to the campaign DB.
+-- ===========================================================================
+
+PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS "user" (
   "id" TEXT PRIMARY KEY,

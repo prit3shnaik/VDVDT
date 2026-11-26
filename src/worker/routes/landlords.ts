@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { Env } from '../env'
-import { requireUser, wardFilter, type AuthedVars } from '../middleware/auth'
+import { requireUser, requireWorkspace, wardFilter, type AuthedVars } from '../middleware/auth'
 import { logActivity } from './activity-logs'
 import { ensureVotersSchema } from '../lib/schema-ensure'
 import {
@@ -23,15 +23,15 @@ import {
 
 export const landlords = new Hono<{ Bindings: Env; Variables: AuthedVars }>()
 
-async function tenantLinkForEpic(db: Env['DB'], epic: string): Promise<boolean> {
-  const row = await db.prepare('SELECT 1 FROM tenant_links WHERE tenant_epic = ?').bind(epic).first()
+async function tenantLinkForEpic(db: Env['DB'], epic: string, workspaceId: string): Promise<boolean> {
+  const row = await db.prepare('SELECT 1 FROM tenant_links WHERE workspace_id = ? AND tenant_epic = ?').bind(workspaceId, epic).first()
   return Boolean(row)
 }
 
-async function landlordForVoterId(db: Env['DB'], voterId: string, excludeId?: string): Promise<boolean> {
+async function landlordForVoterId(db: Env['DB'], voterId: string, workspaceId: string, excludeId?: string): Promise<boolean> {
   const row = await db
-    .prepare('SELECT 1 FROM landlords WHERE voter_id = ? AND (? IS NULL OR id <> ?)')
-    .bind(voterId, excludeId ?? null, excludeId ?? null)
+    .prepare('SELECT 1 FROM landlords WHERE workspace_id = ? AND voter_id = ? AND (? IS NULL OR id <> ?)')
+    .bind(workspaceId, voterId, excludeId ?? null, excludeId ?? null)
     .first()
   return Boolean(row)
 }
@@ -45,13 +45,13 @@ async function loadVoterForProfile(db: Env['DB'], profile: Profile, voterId: str
 }
 
 function validateOffRollWard(profile: Profile, wardNo: number | null): string | null {
-  if (wardFilter(profile).clause === '1=1') return null
+  if (profile.is_platform_admin || profile.workspace_role === 'candidate' || profile.workspace_role === 'incharge') return null
   if (wardNo == null) return 'Ward is required for an off-roll landlord.'
   if (!profile.allowed_wards.includes(wardNo)) return 'Ward is not in your allowed wards.'
   return null
 }
 
-landlords.get('/api/landlords', requireUser, async (c) => {
+landlords.get('/api/landlords', requireUser, requireWorkspace, async (c) => {
   await ensureVotersSchema(c.env.DB)
   const profile = c.get('profile')
   const url = new URL(c.req.url)
@@ -84,8 +84,8 @@ landlords.get('/api/landlords', requireUser, async (c) => {
 
   if (candidateForTenant) {
     const voter = await c.env.DB
-      .prepare('SELECT id FROM voters WHERE epic_no = ?')
-      .bind(candidateForTenant)
+      .prepare('SELECT id FROM voters WHERE workspace_id = ? AND epic_no = ?')
+      .bind(c.get('workspace')!.id, candidateForTenant)
       .first<{ id: string }>()
     if (voter) {
       conditions.push('(l.voter_id IS NULL OR l.voter_id <> ?)')
@@ -119,14 +119,14 @@ landlords.get('/api/landlords', requireUser, async (c) => {
     .prepare(`
       SELECT l.*, COALESCE(tc.tenant_count, 0) AS tenant_count
       FROM landlords l
-      LEFT JOIN voters v ON v.id = l.voter_id
+      LEFT JOIN voters v ON v.id = l.voter_id AND v.workspace_id = l.workspace_id
       LEFT JOIN (
-        SELECT t.landlord_id, COUNT(*) AS tenant_count
+        SELECT t.workspace_id, t.landlord_id, COUNT(*) AS tenant_count
         FROM tenant_links t
-        JOIN voters te ON te.epic_no = t.tenant_epic
+        JOIN voters te ON te.epic_no = t.tenant_epic AND te.workspace_id = t.workspace_id
         WHERE COALESCE(te.is_active, 1) = 1 AND ${tenantWard.clause}
         GROUP BY t.landlord_id
-      ) tc ON tc.landlord_id = l.id
+      ) tc ON tc.landlord_id = l.id AND tc.workspace_id = l.workspace_id
       WHERE ${conditions.join(' AND ')}
       ORDER BY l.display_name COLLATE NOCASE ASC
       LIMIT ?
@@ -134,7 +134,7 @@ landlords.get('/api/landlords', requireUser, async (c) => {
     .bind(...params, limit)
     .all<LandlordRow>()
 
-  const rows = await attachVoters(c.env.DB, results ?? [])
+  const rows = await attachVoters(c.env.DB, results ?? [], c.get('workspace')!.id)
   const counts = candidateForTenant || excludeId
     ? { landlords: 0, tenants: 0, unlinked: 0, onRoll: 0, offRoll: 0 }
     : await loadTenantCounts(c.env.DB, profile)
@@ -142,7 +142,7 @@ landlords.get('/api/landlords', requireUser, async (c) => {
   return c.json({ landlords: rows, counts })
 })
 
-landlords.get('/api/landlords/voter-candidates', requireUser, async (c) => {
+landlords.get('/api/landlords/voter-candidates', requireUser, requireWorkspace, async (c) => {
   await ensureVotersSchema(c.env.DB)
   const profile = c.get('profile')
   const url = new URL(c.req.url)
@@ -160,9 +160,10 @@ landlords.get('/api/landlords/voter-candidates', requireUser, async (c) => {
   return c.json({ voters })
 })
 
-landlords.post('/api/landlords', requireUser, async (c) => {
+landlords.post('/api/landlords', requireUser, requireWorkspace, async (c) => {
   await ensureVotersSchema(c.env.DB)
   const profile = c.get('profile')
+  const workspace = c.get('workspace')!
   if (!canWrite(profile)) return c.json({ error: 'Forbidden' }, 403)
 
   const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>))
@@ -174,10 +175,10 @@ landlords.post('/api/landlords', requireUser, async (c) => {
   if (voterId) {
     voter = await loadVoterForProfile(c.env.DB, profile, voterId)
     if (!voter) return c.json({ error: 'Voter not found in your wards.' }, 400)
-    if (await tenantLinkForEpic(c.env.DB, voter.epic_no)) {
+    if (await tenantLinkForEpic(c.env.DB, voter.epic_no, c.get('workspace')!.id)) {
       return c.json({ error: 'This voter is already a tenant. A voter cannot be both landlord and tenant.' }, 409)
     }
-    if (await landlordForVoterId(c.env.DB, voter.id)) {
+    if (await landlordForVoterId(c.env.DB, voter.id, workspace.id)) {
       return c.json({ error: 'This voter is already a landlord.' }, 409)
     }
   } else {
@@ -196,11 +197,13 @@ landlords.post('/api/landlords', requireUser, async (c) => {
   try {
     await c.env.DB
       .prepare(`
-        INSERT INTO landlords (id, voter_id, display_name, house_no, contact, ward_no, part_no, section, notes, created_at, created_by, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO landlords (id, org_id, workspace_id, voter_id, display_name, house_no, contact, ward_no, part_no, section, notes, created_at, created_by, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .bind(
         id,
+        workspace.org_id,
+        workspace.id,
         voter?.id ?? null,
         displayName,
         houseNo,
@@ -220,7 +223,7 @@ landlords.post('/api/landlords', requireUser, async (c) => {
     throw err
   }
 
-  await logActivity(c.env, profile.id, 'landlord_add', 'landlords', id, {
+  await logActivity(c.env, c.get('workspace'), profile.id, 'landlord_add', 'landlords', id, {
     voter_id: voter?.id ?? null,
     display_name: displayName,
   })
@@ -229,7 +232,7 @@ landlords.post('/api/landlords', requireUser, async (c) => {
   return c.json({ landlord }, 201)
 })
 
-landlords.patch('/api/landlords/:id', requireUser, async (c) => {
+landlords.patch('/api/landlords/:id', requireUser, requireWorkspace, async (c) => {
   await ensureVotersSchema(c.env.DB)
   const profile = c.get('profile')
   if (!canWrite(profile)) return c.json({ error: 'Forbidden' }, 403)
@@ -285,15 +288,15 @@ landlords.patch('/api/landlords/:id', requireUser, async (c) => {
       }
       const voter = await loadVoterForProfile(c.env.DB, profile, requested)
       if (!voter) return c.json({ error: 'Voter not found in your wards.' }, 400)
-      if (await tenantLinkForEpic(c.env.DB, voter.epic_no)) {
+      if (await tenantLinkForEpic(c.env.DB, voter.epic_no, c.get('workspace')!.id)) {
         return c.json({ error: 'This voter is already a tenant. A voter cannot be both landlord and tenant.' }, 409)
       }
-      if (await landlordForVoterId(c.env.DB, voter.id, id)) {
+      if (await landlordForVoterId(c.env.DB, voter.id, c.get('workspace')!.id, id)) {
         return c.json({ error: 'This voter is already a landlord.' }, 409)
       }
       const sameTenant = await c.env.DB
-        .prepare('SELECT 1 FROM tenant_links WHERE landlord_id = ? AND tenant_epic = ?')
-        .bind(id, voter.epic_no)
+        .prepare('SELECT 1 FROM tenant_links WHERE workspace_id = ? AND landlord_id = ? AND tenant_epic = ?')
+        .bind(c.get('workspace')!.id, id, voter.epic_no)
         .first()
       if (sameTenant) {
         return c.json({ error: 'A landlord cannot also be one of their tenants.' }, 400)
@@ -320,14 +323,14 @@ landlords.patch('/api/landlords/:id', requireUser, async (c) => {
   values.push(new Date().toISOString())
 
   try {
-    await c.env.DB.prepare(`UPDATE landlords SET ${updates.join(', ')} WHERE id = ?`).bind(...values, id).run()
+    await c.env.DB.prepare(`UPDATE landlords SET ${updates.join(', ')} WHERE workspace_id = ? AND id = ?`).bind(...values, c.get('workspace')!.id, id).run()
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     if (/unique/i.test(message)) return c.json({ error: 'This voter is already a landlord.' }, 409)
     throw err
   }
 
-  await logActivity(c.env, profile.id, claimed ? 'landlord_claim' : 'landlord_update', 'landlords', id, {
+  await logActivity(c.env, c.get('workspace'), profile.id, claimed ? 'landlord_claim' : 'landlord_update', 'landlords', id, {
     voter_id: nextVoterId,
   })
 
@@ -335,7 +338,7 @@ landlords.patch('/api/landlords/:id', requireUser, async (c) => {
   return c.json({ landlord: updated })
 })
 
-landlords.delete('/api/landlords/:id', requireUser, async (c) => {
+landlords.delete('/api/landlords/:id', requireUser, requireWorkspace, async (c) => {
   await ensureVotersSchema(c.env.DB)
   const profile = c.get('profile')
   if (!canWrite(profile)) return c.json({ error: 'Forbidden' }, 403)
@@ -345,15 +348,15 @@ landlords.delete('/api/landlords/:id', requireUser, async (c) => {
   if (!landlord) return c.json({ error: 'Not found' }, 404)
 
   const countRow = await c.env.DB
-    .prepare('SELECT COUNT(*) AS c FROM tenant_links WHERE landlord_id = ?')
-    .bind(id)
+    .prepare('SELECT COUNT(*) AS c FROM tenant_links WHERE workspace_id = ? AND landlord_id = ?')
+    .bind(c.get('workspace')!.id, id)
     .first<{ c: number }>()
   if (Number(countRow?.c ?? 0) > 0) {
     return c.json({ error: 'Remove or move this landlord\'s tenants before deleting it.' }, 409)
   }
 
-  await c.env.DB.prepare('DELETE FROM landlords WHERE id = ?').bind(id).run()
-  await logActivity(c.env, profile.id, 'landlord_remove', 'landlords', id, {
+  await c.env.DB.prepare('DELETE FROM landlords WHERE workspace_id = ? AND id = ?').bind(c.get('workspace')!.id, id).run()
+  await logActivity(c.env, c.get('workspace'), profile.id, 'landlord_remove', 'landlords', id, {
     voter_id: landlord.voter_id,
     display_name: landlord.display_name,
   })

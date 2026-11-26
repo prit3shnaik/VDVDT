@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import type { Env } from '../env'
-import { requireUser, type AuthedVars } from '../middleware/auth'
+import { requireUser, requireWorkspace, type AuthedVars } from '../middleware/auth'
+import { r2WorkspacePrefix } from '../lib/scope'
 import { servePhoto } from '../lib/serve-photo'
 
 export const storage = new Hono<{ Bindings: Env; Variables: AuthedVars }>()
@@ -25,7 +26,7 @@ function signedPathFor(key: string, size: 't500' | 'orig' = 't500'): string {
 }
 
 // Photo bytes, reachable at the URL supabase-js constructs.
-storage.get('/storage/v1/media/:size/*', requireUser, async (c) => {
+storage.get('/storage/v1/media/:size/*', requireUser, requireWorkspace, async (c) => {
   const size = c.req.param('size') ?? ''
   const key = c.req.path.slice(`/storage/v1/media/${size}/`.length)
   return servePhoto(c, size, key)
@@ -33,7 +34,7 @@ storage.get('/storage/v1/media/:size/*', requireUser, async (c) => {
 
 // createSignedUrls (batch). Registered BEFORE the single-object route below, because
 // the wildcard route also matches this path with an empty remainder.
-storage.post('/storage/v1/object/sign/:bucket', requireUser, async (c) => {
+storage.post('/storage/v1/object/sign/:bucket', requireUser, requireWorkspace, async (c) => {
   if (c.req.param('bucket') !== PHOTO_BUCKET) {
     return c.json({ message: 'Unknown bucket' }, 400)
   }
@@ -53,7 +54,7 @@ storage.post('/storage/v1/object/sign/:bucket', requireUser, async (c) => {
 })
 
 // createSignedUrl (single object).
-storage.post('/storage/v1/object/sign/:bucket/*', requireUser, async (c) => {
+storage.post('/storage/v1/object/sign/:bucket/*', requireUser, requireWorkspace, async (c) => {
   const bucket = c.req.param('bucket')
   if (bucket !== PHOTO_BUCKET) {
     return c.json({ message: 'Unknown bucket' }, 400)
@@ -68,7 +69,7 @@ storage.post('/storage/v1/object/sign/:bucket/*', requireUser, async (c) => {
 })
 
 // upload (used by the import flow for raw xlsx files).
-storage.post('/storage/v1/object/:bucket/*', requireUser, async (c) => {
+storage.post('/storage/v1/object/:bucket/*', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
   if (profile.role !== 'admin' && profile.role !== 'sub-admin') {
     return c.json({ message: 'Forbidden' }, 403)
@@ -80,18 +81,20 @@ storage.post('/storage/v1/object/:bucket/*', requireUser, async (c) => {
   }
 
   const key = c.req.path.slice(`/storage/v1/object/${bucket}/`.length)
-  if (!key) {
+  if (!key || key.includes('..')) {
     return c.json({ message: 'Missing object path' }, 400)
   }
 
+  const workspace = c.get('workspace')!
+  const prefixed = `${r2WorkspacePrefix(workspace.org_id, workspace.id, 'imports')}${key}`
   const { bytes, contentType } = await readUploadBytes(c.req.raw)
-  await c.env.IMPORT_TEMP.put(key, bytes, {
+  await c.env.IMPORT_TEMP.put(prefixed, bytes, {
     httpMetadata: {
       contentType,
     },
   })
 
-  return c.json({ Key: `${bucket}/${key}` })
+  return c.json({ Key: `${bucket}/${prefixed}` })
 })
 
 async function readUploadBytes(request: Request): Promise<{ bytes: ArrayBuffer; contentType: string }> {

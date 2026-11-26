@@ -1,4 +1,5 @@
 import type { Voter } from './types'
+import { withWorkspaceScope } from './workspace'
 
 const CACHE_VERSION = 1
 export const DEFAULT_CACHE_MAX_AGE_MS = 1000 * 60 * 15
@@ -15,7 +16,7 @@ export function buildWardScope(role: string | null | undefined, allowedWards: nu
   const normalizedRole = (role ?? 'user').trim().toLowerCase()
   const wards = Array.from(new Set((allowedWards ?? []).filter((ward) => Number.isFinite(ward)))).sort((a, b) => a - b)
   const wardLabel = wards.length ? wards.join(',') : 'all'
-  return `${normalizedRole}|${wardLabel}`
+  return withWorkspaceScope(`${normalizedRole}|${wardLabel}`)
 }
 
 export function readCachedCollection<T>(cacheKey: string, scope: string, maxAgeMs = DEFAULT_CACHE_MAX_AGE_MS): T[] | null {

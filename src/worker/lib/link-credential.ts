@@ -1,4 +1,4 @@
-import type { Env } from '../env'
+import { platformDb, type Env } from '../env'
 import { createAuth } from '../auth'
 
 /**
@@ -19,9 +19,10 @@ export async function linkCredential(
   displayName: string
 ): Promise<{ authUserId: string; created: boolean }> {
   const auth = createAuth(env)
+  const db = platformDb(env)
   const normalized = email.toLowerCase().trim()
 
-  const existing = await env.DB.prepare('SELECT id FROM [user] WHERE email = ?')
+  const existing = await db.prepare('SELECT id FROM [user] WHERE email = ?')
     .bind(normalized)
     .first<{ id: string }>()
 
@@ -30,7 +31,7 @@ export async function linkCredential(
 
   if (existing) {
     await ctx.internalAdapter.updatePassword(existing.id, hash)
-    await env.DB.prepare('DELETE FROM session WHERE userId = ?').bind(existing.id).run()
+    await db.prepare('DELETE FROM session WHERE userId = ?').bind(existing.id).run()
     return { authUserId: existing.id, created: false }
   }
 

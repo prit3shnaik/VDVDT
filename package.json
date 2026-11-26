@@ -13,7 +13,9 @@
     "verify:api": "node scripts/verify-api.mjs",
     "verify:security": "node scripts/verify-rest-security.mjs",
     "verify:import": "node scripts/verify-import.mjs",
-    "deploy:pages": "npx wrangler pages deploy dist --project-name voterdata-management"
+    "deploy:pages": "npx wrangler pages deploy dist --project-name voterdata-management",
+    "verify:schema": "node scripts/verify-d1-schema.mjs",
+    "verify:tenancy": "node scripts/verify-tenancy-isolation.mjs"
   },
   "dependencies": {
     "@cf-wasm/photon": "^0.4.0",

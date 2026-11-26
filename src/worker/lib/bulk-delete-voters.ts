@@ -77,19 +77,22 @@ function sortFamilyMembers(a: BulkDeleteVoterRow, b: BulkDeleteVoterRow): number
   return (a.name ?? '').localeCompare(b.name ?? '')
 }
 
-async function selectIn<T>(db: D1Database, sqlPrefix: string, values: string[]): Promise<T[]> {
+export interface BulkScope { clause: string; params: unknown[] }
+
+async function selectIn<T>(db: D1Database, sqlPrefix: string, values: string[], scope?: BulkScope): Promise<T[]> {
   if (!values.length) return []
   const out: T[] = []
   for (let i = 0; i < values.length; i += IN_CHUNK) {
     const chunk = values.slice(i, i + IN_CHUNK)
     const placeholders = chunk.map(() => '?').join(',')
-    const { results } = await db.prepare(`${sqlPrefix} (${placeholders})`).bind(...chunk).all()
+    const extra = scope?.clause ? ` AND ${scope.clause}` : ''
+    const { results } = await db.prepare(`${sqlPrefix} (${placeholders})${extra}`).bind(...chunk, ...(scope?.params ?? [])).all()
     if (results?.length) out.push(...(results as T[]))
   }
   return out
 }
 
-async function loadVotersByCompactEpics(db: D1Database, compactEpics: string[]): Promise<BulkDeleteVoterRow[]> {
+async function loadVotersByCompactEpics(db: D1Database, compactEpics: string[], scope?: BulkScope): Promise<BulkDeleteVoterRow[]> {
   const found: BulkDeleteVoterRow[] = []
   const seenIds = new Set<string>()
   const unmatched = new Set(compactEpics)
@@ -99,6 +102,7 @@ async function loadVotersByCompactEpics(db: D1Database, compactEpics: string[]):
     `SELECT id, epic_no, name, family_head_epic, family_label, family_color, display_order, photo_url, part_no, ward_no
      FROM voters WHERE epic_no IN`,
     compactEpics,
+    scope,
   )
   for (const row of exact) {
     if (seenIds.has(row.id)) continue
@@ -117,9 +121,9 @@ async function loadVotersByCompactEpics(db: D1Database, compactEpics: string[]):
       .prepare(
         `SELECT id, epic_no, name, family_head_epic, family_label, family_color, display_order, photo_url, part_no, ward_no
          FROM voters
-         WHERE REPLACE(REPLACE(REPLACE(UPPER(epic_no), ' ', ''), '-', ''), '/', '') IN (${placeholders})`,
+         WHERE REPLACE(REPLACE(REPLACE(UPPER(epic_no), ' ', ''), '-', ''), '/', '') IN (${placeholders})${scope?.clause ? ` AND ${scope.clause}` : ''}`,
       )
-      .bind(...chunk)
+      .bind(...chunk, ...(scope?.params ?? []))
       .all()
     for (const row of ((results ?? []) as unknown as BulkDeleteVoterRow[])) {
       const compact = compactEpic(row.epic_no)
@@ -133,7 +137,7 @@ async function loadVotersByCompactEpics(db: D1Database, compactEpics: string[]):
   return found
 }
 
-async function loadFamilyMembers(db: D1Database, seeds: BulkDeleteVoterRow[]): Promise<BulkDeleteVoterRow[]> {
+async function loadFamilyMembers(db: D1Database, seeds: BulkDeleteVoterRow[], scope?: BulkScope): Promise<BulkDeleteVoterRow[]> {
   const keys = Array.from(new Set(seeds.map(familyGroupKey).filter(Boolean)))
   if (!keys.length) return [...seeds]
   const [byHead, byEpic] = await Promise.all([
@@ -142,12 +146,14 @@ async function loadFamilyMembers(db: D1Database, seeds: BulkDeleteVoterRow[]): P
       `SELECT id, epic_no, name, family_head_epic, family_label, family_color, display_order, photo_url, part_no, ward_no
        FROM voters WHERE family_head_epic IN`,
       keys,
+      scope,
     ),
     selectIn<BulkDeleteVoterRow>(
       db,
       `SELECT id, epic_no, name, family_head_epic, family_label, family_color, display_order, photo_url, part_no, ward_no
        FROM voters WHERE epic_no IN`,
       keys,
+      scope,
     ),
   ])
   const byId = new Map<string, BulkDeleteVoterRow>()
@@ -155,8 +161,8 @@ async function loadFamilyMembers(db: D1Database, seeds: BulkDeleteVoterRow[]): P
   return Array.from(byId.values())
 }
 
-export async function planBulkDelete(db: D1Database, compactEpics: string[]): Promise<BulkDeletePlan> {
-  const listed = await loadVotersByCompactEpics(db, compactEpics)
+export async function planBulkDelete(db: D1Database, compactEpics: string[], scope?: BulkScope): Promise<BulkDeletePlan> {
+  const listed = await loadVotersByCompactEpics(db, compactEpics, scope)
   const foundCompact = new Set(listed.map((row) => compactEpic(row.epic_no)))
   const notFound = compactEpics.filter((epic) => !foundCompact.has(epic))
   const listedIds = new Set(listed.map((row) => row.id))

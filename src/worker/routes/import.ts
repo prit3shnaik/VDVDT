@@ -2,7 +2,8 @@ import { Hono } from 'hono'
 import JSZip from 'jszip'
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../env'
-import { requireUser, requireAdmin, type AuthedVars } from '../middleware/auth'
+import { requireUser, requireAdmin, requireWorkspace, type AuthedVars } from '../middleware/auth'
+import { r2WorkspacePrefix, type WorkspaceRef } from '../lib/scope'
 import type { ParsedRow } from '../lib/xlsx-parse'
 import { parseWorkbook } from '../lib/xlsx-workbook'
 import { indexEmbeddedImages, readImageBytes, type EmbeddedImage } from '../lib/xlsx-images'
@@ -34,8 +35,8 @@ function contentTypeFor(path: string): string {
   return 'image/jpeg'
 }
 
-function stagingKey(batchId: string): string {
-  return `staging/${batchId}.json`
+function stagingKey(workspace: WorkspaceRef, batchId: string): string {
+  return `${r2WorkspacePrefix(workspace.org_id, workspace.id, 'imports')}staging/${batchId}.json`
 }
 
 interface StagedData {
@@ -44,14 +45,15 @@ interface StagedData {
   sheetName: string
 }
 
-async function loadStaged(env: Env, batchId: string): Promise<StagedData | null> {
-  const object = await env.IMPORT_TEMP.get(stagingKey(batchId))
+async function loadStaged(env: Env, workspace: WorkspaceRef, batchId: string): Promise<StagedData | null> {
+  const object = await env.IMPORT_TEMP.get(stagingKey(workspace, batchId))
   if (!object) return null
   return JSON.parse(await object.text()) as StagedData
 }
 
 async function setProgress(
   env: Env,
+  workspace: WorkspaceRef,
   batchId: string,
   phase: string,
   percent: number,
@@ -67,17 +69,17 @@ async function setProgress(
 
   // Never resurrect a batch the user cancelled mid-run.
   await env.DB.prepare(
-    `UPDATE import_batches SET ${columns.join(', ')} WHERE id = ? AND status != 'cancelled'`
+    `UPDATE import_batches SET ${columns.join(', ')} WHERE id = ? AND workspace_id = ? AND status != 'cancelled'`
   )
-    .bind(...values, batchId)
+    .bind(...values, batchId, workspace.id)
     .run()
 }
 
-async function assertActive(env: Env, batchId: string): Promise<{ storage_path: string } | null> {
+async function assertActive(env: Env, workspace: WorkspaceRef, batchId: string): Promise<{ storage_path: string } | null> {
   const row = await env.DB.prepare(
-    "SELECT storage_path, status FROM import_batches WHERE id = ?"
+    "SELECT storage_path, status FROM import_batches WHERE id = ? AND workspace_id = ?"
   )
-    .bind(batchId)
+    .bind(batchId, workspace.id)
     .first<{ storage_path: string | null; status: string }>()
 
   if (!row || row.status === 'cancelled' || !row.storage_path) return null
@@ -87,27 +89,28 @@ async function assertActive(env: Env, batchId: string): Promise<{ storage_path: 
 // ---------------------------------------------------------------------------
 // 1. Parse + duplicate preview
 // ---------------------------------------------------------------------------
-importRoutes.post('/api/import/parse', requireUser, requireAdmin, async (c) => {
+importRoutes.post('/api/import/parse', requireUser, requireWorkspace, requireAdmin, async (c) => {
+  const workspace = c.get('workspace')!
   const { batchId } = await c.req.json<{ batchId?: string }>()
   if (!batchId) return c.json({ error: 'batchId is required' }, 400)
 
-  const batch = await assertActive(c.env, batchId)
+  const batch = await assertActive(c.env, workspace, batchId)
   if (!batch) return c.json({ error: 'Batch not found or cancelled' }, 404)
   await ensureVotersSchema(c.env.DB)
 
   try {
-    await setProgress(c.env, batchId, 'reading', 10, { status: 'running' })
+    await setProgress(c.env, workspace, batchId, 'reading', 10, { status: 'running' })
 
     const file = await c.env.IMPORT_TEMP.get(batch.storage_path)
     if (!file) return c.json({ error: 'Uploaded file is no longer in storage' }, 404)
 
     const bytes = new Uint8Array(await file.arrayBuffer())
-    await setProgress(c.env, batchId, 'parsing', 35)
+    await setProgress(c.env, workspace, batchId, 'parsing', 35)
     const parsed = parseWorkbook(bytes)
     const sheetName = parsed.sheetName
 
     if (parsed.rows.length === 0) {
-      await setProgress(c.env, batchId, 'failed', 100, {
+      await setProgress(c.env, workspace, batchId, 'failed', 100, {
         status: 'failed',
         error_report: JSON.stringify(parsed.errors.slice(0, 500)),
       })
@@ -125,12 +128,12 @@ importRoutes.post('/api/import/parse', requireUser, requireAdmin, async (c) => {
     }
 
     await c.env.IMPORT_TEMP.put(
-      stagingKey(batchId),
+      stagingKey(workspace, batchId),
       JSON.stringify({ rows: parsed.rows, images, sheetName } satisfies StagedData),
       { httpMetadata: { contentType: 'application/json' } }
     )
 
-    await setProgress(c.env, batchId, 'checking-duplicates', 60)
+    await setProgress(c.env, workspace, batchId, 'checking-duplicates', 60)
 
     type ExistingVoter = {
       epic_no: string
@@ -157,9 +160,9 @@ importRoutes.post('/api/import/parse', requireUser, requireAdmin, async (c) => {
       const { results } = await c.env.DB.prepare(
         `SELECT epic_no, name, relative_name, date_of_birth, contact_no_1, part_no, section,
                 section_name, sr_no_roll, house_no, age, gender, photo_url, is_active
-         FROM voters WHERE epic_no IN (${placeholders})`
+         FROM voters WHERE workspace_id = ? AND epic_no IN (${placeholders})`
       )
-        .bind(...slice)
+        .bind(workspace.id, ...slice)
         .all<ExistingVoter>()
 
       for (const row of results ?? []) existingByEpic.set(row.epic_no, row)
@@ -217,7 +220,7 @@ importRoutes.post('/api/import/parse', requireUser, requireAdmin, async (c) => {
       ),
     ].join('\n')
 
-    await setProgress(c.env, batchId, 'awaiting-confirmation', 70, {
+    await setProgress(c.env, workspace, batchId, 'awaiting-confirmation', 70, {
       status: 'awaiting_confirmation',
       total_rows: parsed.rows.length,
       error_report: JSON.stringify(parsed.errors.slice(0, 500)),
@@ -261,7 +264,7 @@ importRoutes.post('/api/import/parse', requireUser, requireAdmin, async (c) => {
     })
   } catch (err) {
     console.error('import parse failed', err)
-    await setProgress(c.env, batchId, 'failed', 100, {
+    await setProgress(c.env, workspace, batchId, 'failed', 100, {
       status: 'failed',
       error_report: JSON.stringify([{ row: 0, reason: err instanceof Error ? err.message : 'Parse failed' }]),
     })
@@ -278,16 +281,17 @@ const UPSERT_COLUMNS = [
   'contact_no_2', 'gender', 'religion', 'state', 'family_head_epic',
 ] as const
 
-importRoutes.post('/api/import/commit', requireUser, requireAdmin, async (c) => {
+importRoutes.post('/api/import/commit', requireUser, requireWorkspace, requireAdmin, async (c) => {
+  const workspace = c.get('workspace')!
   const profile = c.get('profile')
   const { batchId, offset = 0 } = await c.req.json<{ batchId?: string; offset?: number }>()
   if (!batchId) return c.json({ error: 'batchId is required' }, 400)
 
-  const batch = await assertActive(c.env, batchId)
+  const batch = await assertActive(c.env, workspace, batchId)
   if (!batch) return c.json({ error: 'Batch not found or cancelled' }, 404)
   await ensureVotersSchema(c.env.DB)
 
-  const staged = await loadStaged(c.env, batchId)
+  const staged = await loadStaged(c.env, workspace, batchId)
   if (!staged) return c.json({ error: 'Staged data missing; re-run parse' }, 409)
 
   const slice = staged.rows.slice(offset, offset + COMMIT_CHUNK)
@@ -304,14 +308,16 @@ importRoutes.post('/api/import/commit', requireUser, requireAdmin, async (c) => 
     .map((col) => (col === 'name' ? 'name = excluded.name' : `${col} = COALESCE(excluded.${col}, voters.${col})`))
     .join(', ')
 
-  const sql = `INSERT INTO voters (id, ${UPSERT_COLUMNS.join(', ')}, is_active, disabled_at, disabled_reason, created_at, updated_at, updated_by)
-     VALUES (${['?', ...UPSERT_COLUMNS.map(() => '?'), '1', 'NULL', 'NULL', '?', '?', '?'].join(', ')})
-     ON CONFLICT(epic_no) DO UPDATE SET ${updateSet}, is_active = 1, disabled_at = NULL, disabled_reason = NULL, updated_at = excluded.updated_at, updated_by = excluded.updated_by`
+  const sql = `INSERT INTO voters (id, org_id, workspace_id, ${UPSERT_COLUMNS.join(', ')}, is_active, disabled_at, disabled_reason, created_at, updated_at, updated_by)
+     VALUES (${['?', '?', '?', ...UPSERT_COLUMNS.map(() => '?'), '1', 'NULL', 'NULL', '?', '?', '?'].join(', ')})
+     ON CONFLICT(workspace_id, epic_no) DO UPDATE SET ${updateSet}, is_active = 1, disabled_at = NULL, disabled_reason = NULL, updated_at = excluded.updated_at, updated_by = excluded.updated_by`
 
   const statement = c.env.DB.prepare(sql)
   const batchStatements = slice.map((row) =>
     statement.bind(
       crypto.randomUUID(),
+      workspace.org_id,
+      workspace.id,
       ...UPSERT_COLUMNS.map((col) => (row as unknown as Record<string, unknown>)[col] ?? null),
       now,
       now,
@@ -323,7 +329,7 @@ importRoutes.post('/api/import/commit', requireUser, requireAdmin, async (c) => 
     await c.env.DB.batch(batchStatements)
   } catch (err) {
     console.error('import commit failed', err)
-    await setProgress(c.env, batchId, 'failed', 100, {
+    await setProgress(c.env, workspace, batchId, 'failed', 100, {
       status: 'failed',
       error_report: JSON.stringify([{ row: offset, reason: err instanceof Error ? err.message : 'Commit failed' }]),
     })
@@ -334,7 +340,7 @@ importRoutes.post('/api/import/commit', requireUser, requireAdmin, async (c) => 
   const done = nextOffset >= staged.rows.length
   const percent = 70 + Math.round((nextOffset / Math.max(staged.rows.length, 1)) * 20)
 
-  await setProgress(c.env, batchId, done ? 'rows-committed' : 'committing', percent, {
+  await setProgress(c.env, workspace, batchId, done ? 'rows-committed' : 'committing', percent, {
     success_count: nextOffset,
   })
 
@@ -350,21 +356,22 @@ importRoutes.post('/api/import/commit', requireUser, requireAdmin, async (c) => 
 // ---------------------------------------------------------------------------
 // 3. Photos (one chunk per call)
 // ---------------------------------------------------------------------------
-importRoutes.post('/api/import/photos', requireUser, requireAdmin, async (c) => {
+importRoutes.post('/api/import/photos', requireUser, requireWorkspace, requireAdmin, async (c) => {
+  const workspace = c.get('workspace')!
   const { batchId, offset = 0 } = await c.req.json<{ batchId?: string; offset?: number }>()
   if (!batchId) return c.json({ error: 'batchId is required' }, 400)
 
-  const batch = await assertActive(c.env, batchId)
+  const batch = await assertActive(c.env, workspace, batchId)
   if (!batch) return c.json({ error: 'Batch not found or cancelled' }, 404)
 
-  const staged = await loadStaged(c.env, batchId)
+  const staged = await loadStaged(c.env, workspace, batchId)
   if (!staged) return c.json({ error: 'Staged data missing; re-run parse' }, 409)
 
   const slice = staged.images.slice(offset, offset + PHOTO_CHUNK)
   if (slice.length === 0) {
-    await setProgress(c.env, batchId, 'completed', 100, { status: 'completed' })
-    await c.env.IMPORT_TEMP.delete(stagingKey(batchId))
-    await refreshDashboardStats(c.env.DB)
+    await setProgress(c.env, workspace, batchId, 'completed', 100, { status: 'completed' })
+    await c.env.IMPORT_TEMP.delete(stagingKey(workspace, batchId))
+    await refreshDashboardStats(c.env.DB, workspace.id, workspace.org_id)
     return c.json({ done: true, nextOffset: offset, processed: 0 })
   }
 
@@ -392,6 +399,7 @@ importRoutes.post('/api/import/photos', requireUser, requireAdmin, async (c) => 
     }
 
     const key = `epic/${epic}.png`
+    const photoPrefix = r2WorkspacePrefix(workspace.org_id, workspace.id, 'photos')
 
     // Some sheets embed non-raster drawings (EMF) mislabelled as images; store the
     // original rather than failing the whole import.
@@ -400,21 +408,21 @@ importRoutes.post('/api/import/photos', requireUser, requireAdmin, async (c) => 
     try {
       thumbnail = makeThumbnail(bytes)
     } catch {
-      thumbnail = bytes
       thumbnailed = false
     }
 
-    await c.env.PHOTOS.put(`orig/${key}`, bytes as unknown as ArrayBuffer, {
+    await c.env.PHOTOS.put(`${photoPrefix}orig/${key}`, bytes as unknown as ArrayBuffer, {
       httpMetadata: { contentType: contentTypeFor(image.path) },
     })
-    await c.env.PHOTOS.put(`t500/${key}`, thumbnail as unknown as ArrayBuffer, {
+    await c.env.PHOTOS.put(`${photoPrefix}t500/${key}`, thumbnail as unknown as ArrayBuffer, {
       httpMetadata: { contentType: thumbnailed ? 'image/webp' : contentTypeFor(image.path) },
     })
 
     updates.push(
-      c.env.DB.prepare('UPDATE voters SET photo_url = ?, updated_at = ? WHERE epic_no = ?').bind(
+      c.env.DB.prepare('UPDATE voters SET photo_url = ?, updated_at = ? WHERE workspace_id = ? AND epic_no = ?').bind(
         key,
         new Date().toISOString(),
+        workspace.id,
         epic
       )
     )
@@ -428,11 +436,11 @@ importRoutes.post('/api/import/photos', requireUser, requireAdmin, async (c) => 
   const percent = 90 + Math.round((nextOffset / Math.max(staged.images.length, 1)) * 10)
 
   if (done) {
-    await setProgress(c.env, batchId, 'completed', 100, { status: 'completed' })
-    await c.env.IMPORT_TEMP.delete(stagingKey(batchId))
-    await refreshDashboardStats(c.env.DB)
+    await setProgress(c.env, workspace, batchId, 'completed', 100, { status: 'completed' })
+    await c.env.IMPORT_TEMP.delete(stagingKey(workspace, batchId))
+    await refreshDashboardStats(c.env.DB, workspace.id, workspace.org_id)
   } else {
-    await setProgress(c.env, batchId, 'photos', percent)
+    await setProgress(c.env, workspace, batchId, 'photos', percent)
   }
 
   return c.json({ done, nextOffset, processed, skipped, total: staged.images.length })
@@ -448,11 +456,14 @@ const MAX_PHOTO_BYTES = 10 * 1024 * 1024
  * The browser posts bytes straight here, so images never make a round trip through
  * a temp bucket the way the old Edge Function required.
  */
-importRoutes.put('/api/import/photo/:epic', requireUser, requireAdmin, async (c) => {
+importRoutes.put('/api/import/photo/:epic', requireUser, requireWorkspace, requireAdmin, async (c) => {
+  const workspace = c.get('workspace')!
   const epic = (c.req.param('epic') ?? '').trim().toUpperCase()
   if (!epic) return c.json({ error: 'epic is required' }, 400)
 
-  const voter = await c.env.DB.prepare('SELECT id FROM voters WHERE epic_no = ?').bind(epic).first()
+  const voter = await c.env.DB.prepare('SELECT id FROM voters WHERE workspace_id = ? AND epic_no = ?')
+    .bind(workspace.id, epic)
+    .first()
   if (!voter) return c.json({ status: 'not_found', epic }, 404)
 
   const body = await c.req.arrayBuffer()
@@ -461,6 +472,7 @@ importRoutes.put('/api/import/photo/:epic', requireUser, requireAdmin, async (c)
 
   const bytes = new Uint8Array(body)
   const key = `epic/${epic}.png`
+  const photoPrefix = r2WorkspacePrefix(workspace.org_id, workspace.id, 'photos')
 
   let thumbnail: Uint8Array = bytes
   let thumbnailed = true
@@ -470,15 +482,15 @@ importRoutes.put('/api/import/photo/:epic', requireUser, requireAdmin, async (c)
     thumbnailed = false
   }
 
-  await c.env.PHOTOS.put(`orig/${key}`, bytes as unknown as ArrayBuffer, {
+  await c.env.PHOTOS.put(`${photoPrefix}orig/${key}`, bytes as unknown as ArrayBuffer, {
     httpMetadata: { contentType: c.req.header('content-type') || 'image/jpeg' },
   })
-  await c.env.PHOTOS.put(`t500/${key}`, thumbnail as unknown as ArrayBuffer, {
+  await c.env.PHOTOS.put(`${photoPrefix}t500/${key}`, thumbnail as unknown as ArrayBuffer, {
     httpMetadata: { contentType: thumbnailed ? 'image/webp' : c.req.header('content-type') || 'image/jpeg' },
   })
 
-  await c.env.DB.prepare('UPDATE voters SET photo_url = ?, updated_at = ? WHERE epic_no = ?')
-    .bind(key, new Date().toISOString(), epic)
+  await c.env.DB.prepare('UPDATE voters SET photo_url = ?, updated_at = ? WHERE workspace_id = ? AND epic_no = ?')
+    .bind(key, new Date().toISOString(), workspace.id, epic)
     .run()
 
   return c.json({ status: 'ok', epic, thumbnailed })
@@ -487,16 +499,17 @@ importRoutes.put('/api/import/photo/:epic', requireUser, requireAdmin, async (c)
 // ---------------------------------------------------------------------------
 // 5. Cancel
 // ---------------------------------------------------------------------------
-importRoutes.post('/api/import/cancel', requireUser, requireAdmin, async (c) => {
+importRoutes.post('/api/import/cancel', requireUser, requireWorkspace, requireAdmin, async (c) => {
+  const workspace = c.get('workspace')!
   const { batchId } = await c.req.json<{ batchId?: string }>()
   if (!batchId) return c.json({ error: 'batchId is required' }, 400)
 
   await c.env.DB.prepare(
-    "UPDATE import_batches SET status = 'cancelled', progress_phase = 'cancelled' WHERE id = ?"
+    "UPDATE import_batches SET status = 'cancelled', progress_phase = 'cancelled' WHERE id = ? AND workspace_id = ?"
   )
-    .bind(batchId)
+    .bind(batchId, workspace.id)
     .run()
 
-  await c.env.IMPORT_TEMP.delete(stagingKey(batchId))
+  await c.env.IMPORT_TEMP.delete(stagingKey(workspace, batchId))
   return c.json({ ok: true })
 })

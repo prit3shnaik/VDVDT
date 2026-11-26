@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { z } from 'zod'
 import type { Env } from '../env'
-import { requireUser, requireAdmin, wardFilter, type AuthedVars } from '../middleware/auth'
+import { requireUser, requireAdmin, requireWorkspace, wardFilter, type AuthedVars } from '../middleware/auth'
 import { ensureBoothSchema } from '../lib/schema-ensure'
 import { logActivity } from './activity-logs'
 import { activeVoterSql } from '../lib/voter-active'
@@ -33,16 +33,16 @@ const leaderAssignSchema = z.object({
 
 type LeaderLink = { team_leader_id: string; display_name: string | null; part_no: number | null; section: number | null }
 
-async function loadLeaderLinks(db: Env['DB'], userId: string): Promise<LeaderLink[]> {
+async function loadLeaderLinks(db: Env['DB'], userId: string, workspaceId: string): Promise<LeaderLink[]> {
   const { results } = await db
     .prepare(
       `SELECT tlu.team_leader_id, COALESCE(tl.display_name, v.name) AS display_name, tl.part_no, tl.section
        FROM team_leader_users tlu
        JOIN team_leaders tl ON tl.id = tlu.team_leader_id
        LEFT JOIN voters v ON v.id = tl.voter_id
-       WHERE tlu.user_id = ?`,
+       WHERE tlu.user_id = ? AND tlu.workspace_id = ?`,
     )
-    .bind(userId)
+    .bind(userId, workspaceId)
     .all<LeaderLink>()
   return results ?? []
 }
@@ -89,6 +89,7 @@ async function familyAssignedToLeaders(
   db: Env['DB'],
   familyKey: string,
   leaderIds: string[],
+  workspaceId: string,
 ): Promise<string | null> {
   if (leaderIds.length === 0) return null
   const placeholders = leaderIds.map(() => '?').join(',')
@@ -97,32 +98,33 @@ async function familyAssignedToLeaders(
       `SELECT a.team_leader_id
        FROM team_leader_assignments a
        JOIN voters v ON v.id = a.voter_id
-       WHERE a.team_leader_id IN (${placeholders})
+       WHERE a.workspace_id = ? AND a.team_leader_id IN (${placeholders})
          AND COALESCE(NULLIF(TRIM(v.family_head_epic), ''), v.epic_no) = ?
        LIMIT 1`,
     )
-    .bind(...leaderIds, familyKey)
+    .bind(workspaceId, ...leaderIds, familyKey)
     .first<{ team_leader_id: string }>()
   return row?.team_leader_id ?? null
 }
 
-field.get('/api/field/me', requireUser, async (c) => {
+field.get('/api/field/me', requireUser, requireWorkspace, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   if (isAdmin(profile)) {
     return c.json({ admin: true, leaders: [] as LeaderLink[] })
   }
-  const leaders = await loadLeaderLinks(c.env.DB, profile.id)
+  const leaders = await loadLeaderLinks(c.env.DB, profile.id, c.get('workspace')!.id)
   return c.json({ admin: false, leaders })
 })
 
-field.post('/api/field/leaders', requireUser, requireAdmin, async (c) => {
+field.post('/api/field/leaders', requireUser, requireWorkspace, requireAdmin, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
+  const workspace = c.get('workspace')!
   const parsed = leaderAssignSchema.safeParse(await c.req.json())
   if (!parsed.success) return c.json({ error: 'Invalid body' }, 400)
-  const leader = await c.env.DB.prepare('SELECT id FROM team_leaders WHERE id = ?')
-    .bind(parsed.data.team_leader_id)
+  const leader = await c.env.DB.prepare('SELECT id FROM team_leaders WHERE workspace_id = ? AND id = ?')
+    .bind(workspace.id, parsed.data.team_leader_id)
     .first()
   if (!leader) return c.json({ error: 'Team leader not found' }, 404)
   const user = await c.env.DB.prepare('SELECT id FROM users WHERE id = ?').bind(parsed.data.user_id).first()
@@ -130,19 +132,19 @@ field.post('/api/field/leaders', requireUser, requireAdmin, async (c) => {
   const id = crypto.randomUUID()
   try {
     await c.env.DB.prepare(
-      `INSERT INTO team_leader_users (id, team_leader_id, user_id, assigned_by, assigned_at)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO team_leader_users (id, org_id, workspace_id, team_leader_id, user_id, assigned_by, assigned_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
-      .bind(id, parsed.data.team_leader_id, parsed.data.user_id, profile.id, new Date().toISOString())
+      .bind(id, workspace.org_id, workspace.id, parsed.data.team_leader_id, parsed.data.user_id, profile.id, new Date().toISOString())
       .run()
   } catch {
     return c.json({ error: 'Already assigned' }, 409)
   }
-  await logActivity(c.env, profile.id, 'field_leader_assign', 'team_leader_users', id, parsed.data)
+  await logActivity(c.env, c.get('workspace'), profile.id, 'field_leader_assign', 'team_leader_users', id, parsed.data)
   return c.json({ id }, 201)
 })
 
-field.get('/api/field/leaders', requireUser, requireAdmin, async (c) => {
+field.get('/api/field/leaders', requireUser, requireWorkspace, requireAdmin, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const { results } = await c.env.DB.prepare(
     `SELECT tlu.*, u.full_name, u.email, COALESCE(tl.display_name, v.name) AS leader_name
@@ -150,18 +152,21 @@ field.get('/api/field/leaders', requireUser, requireAdmin, async (c) => {
      JOIN users u ON u.id = tlu.user_id
      JOIN team_leaders tl ON tl.id = tlu.team_leader_id
      LEFT JOIN voters v ON v.id = tl.voter_id
+     WHERE tlu.workspace_id = ?
      ORDER BY u.full_name`,
-  ).all()
+  ).bind(c.get('workspace')!.id).all()
   return c.json({ links: results ?? [] })
 })
 
-field.delete('/api/field/leaders/:id', requireUser, requireAdmin, async (c) => {
+field.delete('/api/field/leaders/:id', requireUser, requireWorkspace, requireAdmin, async (c) => {
   await ensureBoothSchema(c.env.DB)
-  await c.env.DB.prepare('DELETE FROM team_leader_users WHERE id = ?').bind(c.req.param('id')).run()
+  await c.env.DB.prepare('DELETE FROM team_leader_users WHERE workspace_id = ? AND id = ?')
+    .bind(c.get('workspace')!.id, c.req.param('id'))
+    .run()
   return c.json({ success: true })
 })
 
-field.get('/api/field/scope', requireUser, async (c) => {
+field.get('/api/field/scope', requireUser, requireWorkspace, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   const { clause, params: wardParams } = wardFilter(profile)
@@ -173,9 +178,9 @@ field.get('/api/field/scope', requireUser, async (c) => {
       const { results } = await c.env.DB.prepare(
         `SELECT a.voter_id FROM team_leader_assignments a
          JOIN voters v ON v.id = a.voter_id
-         WHERE a.team_leader_id = ? AND ${voterClause}`,
+         WHERE a.workspace_id = ? AND a.team_leader_id = ? AND ${voterClause}`,
       )
-        .bind(leaderId, ...wardParams)
+        .bind(c.get('workspace')!.id, leaderId, ...wardParams)
         .all<{ voter_id: string }>()
       return c.json({
         admin: true,
@@ -186,7 +191,7 @@ field.get('/api/field/scope', requireUser, async (c) => {
     return c.json({ admin: true, team_leader_ids: [] as string[], assigned_voter_ids: [] as string[] })
   }
 
-  const leaders = await loadLeaderLinks(c.env.DB, profile.id)
+  const leaders = await loadLeaderLinks(c.env.DB, profile.id, c.get('workspace')!.id)
   const ids = leaders.map((l) => l.team_leader_id)
   if (ids.length === 0) {
     return c.json({ admin: false, leaders, team_leader_ids: [], assigned_voter_ids: [] as string[] })
@@ -195,9 +200,9 @@ field.get('/api/field/scope', requireUser, async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT a.voter_id FROM team_leader_assignments a
      JOIN voters v ON v.id = a.voter_id
-     WHERE a.team_leader_id IN (${placeholders}) AND ${voterClause}`,
+     WHERE a.workspace_id = ? AND a.team_leader_id IN (${placeholders}) AND ${voterClause}`,
   )
-    .bind(...ids, ...wardParams)
+    .bind(c.get('workspace')!.id, ...ids, ...wardParams)
     .all<{ voter_id: string }>()
   return c.json({
     admin: false,
@@ -207,7 +212,7 @@ field.get('/api/field/scope', requireUser, async (c) => {
   })
 })
 
-field.get('/api/field/geocode', requireUser, async (c) => {
+field.get('/api/field/geocode', requireUser, requireWorkspace, async (c) => {
   const lat = Number(c.req.query('lat'))
   const lng = Number(c.req.query('lng'))
   if (
@@ -239,7 +244,7 @@ field.get('/api/field/geocode', requireUser, async (c) => {
   }
 })
 
-field.get('/api/field/geotags', requireUser, async (c) => {
+field.get('/api/field/geotags', requireUser, requireWorkspace, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   const { clause, params: wardParams } = wardFilter(profile)
@@ -247,15 +252,16 @@ field.get('/api/field/geotags', requireUser, async (c) => {
   const leaderId = c.req.query('team_leader_id')
   const partNo = c.req.query('part_no')
 
-  const conditions = [`EXISTS (
+  const conditions = [`g.workspace_id = ?`, `EXISTS (
     SELECT 1 FROM voters v
     WHERE COALESCE(NULLIF(TRIM(v.family_head_epic), ''), v.epic_no) = g.family_key
+      AND v.workspace_id = g.workspace_id
       AND ${voterClause}
   )`]
-  const params: unknown[] = [...wardParams]
+  const params: unknown[] = [c.get('workspace')!.id, ...wardParams]
 
   if (!isAdmin(profile)) {
-    const leaders = await loadLeaderLinks(c.env.DB, profile.id)
+    const leaders = await loadLeaderLinks(c.env.DB, profile.id, c.get('workspace')!.id)
     const ids = leaders.map((l) => l.team_leader_id)
     if (ids.length === 0) return c.json({ geotags: [] })
     const placeholders = ids.map(() => '?').join(',')
@@ -269,6 +275,7 @@ field.get('/api/field/geotags', requireUser, async (c) => {
     conditions.push(`EXISTS (
       SELECT 1 FROM voters v2
       WHERE COALESCE(NULLIF(TRIM(v2.family_head_epic), ''), v2.epic_no) = g.family_key
+        AND v2.workspace_id = g.workspace_id
         AND v2.part_no = ?
     )`)
     params.push(Number(partNo))
@@ -282,7 +289,7 @@ field.get('/api/field/geotags', requireUser, async (c) => {
             head.section,
             head.photo_url
      FROM family_geotags g
-     LEFT JOIN voters head ON head.epic_no = g.family_key
+     LEFT JOIN voters head ON head.epic_no = g.family_key AND head.workspace_id = g.workspace_id
      WHERE ${conditions.join(' AND ')}
      ORDER BY g.tagged_at DESC`,
   )
@@ -292,7 +299,7 @@ field.get('/api/field/geotags', requireUser, async (c) => {
   return c.json({ geotags: results ?? [] })
 })
 
-field.get('/api/field/geotags/untagged', requireUser, async (c) => {
+field.get('/api/field/geotags/untagged', requireUser, requireWorkspace, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   const { clause, params: wardParams } = wardFilter(profile)
@@ -303,7 +310,7 @@ field.get('/api/field/geotags/untagged', requireUser, async (c) => {
   if (isAdmin(profile)) {
     if (leaderIdParam) leaderIds = [leaderIdParam]
   } else {
-    leaderIds = (await loadLeaderLinks(c.env.DB, profile.id)).map((l) => l.team_leader_id)
+    leaderIds = (await loadLeaderLinks(c.env.DB, profile.id, c.get('workspace')!.id)).map((l) => l.team_leader_id)
   }
 
   if (leaderIds.length === 0 && !isAdmin(profile)) {
@@ -317,10 +324,10 @@ field.get('/api/field/geotags/untagged', requireUser, async (c) => {
          FROM voters v
          WHERE ${voterClause}
        ) f
-       LEFT JOIN family_geotags g ON g.family_key = f.family_key
+       LEFT JOIN family_geotags g ON g.family_key = f.family_key AND g.workspace_id = ?
        WHERE g.family_key IS NULL`,
     )
-      .bind(...wardParams)
+      .bind(...wardParams, c.get('workspace')!.id)
       .first<{ count: number }>()
     return c.json({ untagged: [], count: Number(row?.count ?? 0) })
   }
@@ -332,15 +339,15 @@ field.get('/api/field/geotags/untagged', requireUser, async (c) => {
        SELECT DISTINCT COALESCE(NULLIF(TRIM(v.family_head_epic), ''), v.epic_no) AS family_key
        FROM team_leader_assignments a
        JOIN voters v ON v.id = a.voter_id
-       WHERE a.team_leader_id IN (${placeholders}) AND ${voterClause}
+       WHERE a.workspace_id = ? AND a.team_leader_id IN (${placeholders}) AND ${voterClause}
      ) f
-     LEFT JOIN family_geotags g ON g.family_key = f.family_key
-     LEFT JOIN voters head ON head.epic_no = f.family_key
+     LEFT JOIN family_geotags g ON g.family_key = f.family_key AND g.workspace_id = ?
+     LEFT JOIN voters head ON head.epic_no = f.family_key AND head.workspace_id = ?
      WHERE g.family_key IS NULL
      ORDER BY head.name
      LIMIT 500`,
   )
-    .bind(...leaderIds, ...wardParams)
+    .bind(c.get('workspace')!.id, ...leaderIds, ...wardParams, c.get('workspace')!.id, c.get('workspace')!.id)
     .all()
 
   const countRow = await c.env.DB.prepare(
@@ -348,18 +355,18 @@ field.get('/api/field/geotags/untagged', requireUser, async (c) => {
        SELECT DISTINCT COALESCE(NULLIF(TRIM(v.family_head_epic), ''), v.epic_no) AS family_key
        FROM team_leader_assignments a
        JOIN voters v ON v.id = a.voter_id
-       WHERE a.team_leader_id IN (${placeholders}) AND ${voterClause}
+       WHERE a.workspace_id = ? AND a.team_leader_id IN (${placeholders}) AND ${voterClause}
      ) f
-     LEFT JOIN family_geotags g ON g.family_key = f.family_key
+     LEFT JOIN family_geotags g ON g.family_key = f.family_key AND g.workspace_id = ?
      WHERE g.family_key IS NULL`,
   )
-    .bind(...leaderIds, ...wardParams)
+    .bind(c.get('workspace')!.id, ...leaderIds, ...wardParams, c.get('workspace')!.id)
     .first<{ count: number }>()
 
   return c.json({ untagged: results ?? [], count: Number(countRow?.count ?? 0) })
 })
 
-field.get('/api/field/geotags/:familyKey/members', requireUser, async (c) => {
+field.get('/api/field/geotags/:familyKey/members', requireUser, requireWorkspace, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   const familyKey = decodeURIComponent(c.req.param('familyKey') ?? '')
@@ -367,11 +374,12 @@ field.get('/api/field/geotags/:familyKey/members', requireUser, async (c) => {
   const voterClause = `${clause.replaceAll('ward_no', 'v.ward_no')} AND ${activeVoterSql('v')}`
 
   if (!isAdmin(profile)) {
-    const leaders = await loadLeaderLinks(c.env.DB, profile.id)
+    const leaders = await loadLeaderLinks(c.env.DB, profile.id, c.get('workspace')!.id)
     const assigned = await familyAssignedToLeaders(
       c.env.DB,
       familyKey,
       leaders.map((l) => l.team_leader_id),
+      c.get('workspace')!.id,
     )
     if (!assigned) return c.json({ error: 'Forbidden' }, 403)
   }
@@ -385,14 +393,14 @@ field.get('/api/field/geotags/:familyKey/members', requireUser, async (c) => {
     .bind(familyKey, familyKey, ...wardParams)
     .all()
 
-  const pin = await c.env.DB.prepare('SELECT * FROM family_geotags WHERE family_key = ?')
-    .bind(familyKey)
+  const pin = await c.env.DB.prepare('SELECT * FROM family_geotags WHERE workspace_id = ? AND family_key = ?')
+    .bind(c.get('workspace')!.id, familyKey)
     .first()
 
   return c.json({ members: results ?? [], geotag: pin })
 })
 
-field.post('/api/field/geotags', requireUser, async (c) => {
+field.post('/api/field/geotags', requireUser, requireWorkspace, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   const parsed = geotagSchema.safeParse(await c.req.json())
@@ -400,9 +408,9 @@ field.post('/api/field/geotags', requireUser, async (c) => {
   const body = parsed.data
 
   const existingEvent = await c.env.DB.prepare(
-    'SELECT * FROM family_geotags WHERE client_event_id = ?',
+    'SELECT * FROM family_geotags WHERE workspace_id = ? AND client_event_id = ?',
   )
-    .bind(body.event_id)
+    .bind(c.get('workspace')!.id, body.event_id)
     .first()
   if (existingEvent) return c.json({ ok: true, duplicate: true, geotag: existingEvent })
 
@@ -415,22 +423,22 @@ field.post('/api/field/geotags', requireUser, async (c) => {
       `SELECT a.team_leader_id
        FROM team_leader_assignments a
        JOIN voters v ON v.id = a.voter_id
-       WHERE COALESCE(NULLIF(TRIM(v.family_head_epic), ''), v.epic_no) = ?
+       WHERE a.workspace_id = ? AND COALESCE(NULLIF(TRIM(v.family_head_epic), ''), v.epic_no) = ?
        LIMIT 1`,
     )
-      .bind(resolved.family_key)
+      .bind(c.get('workspace')!.id, resolved.family_key)
       .first<{ team_leader_id: string }>()
     teamLeaderId = assigned?.team_leader_id ?? null
   } else {
-    const leaders = await loadLeaderLinks(c.env.DB, profile.id)
+    const leaders = await loadLeaderLinks(c.env.DB, profile.id, c.get('workspace')!.id)
     const ids = leaders.map((l) => l.team_leader_id)
-    const assigned = await familyAssignedToLeaders(c.env.DB, resolved.family_key, ids)
+    const assigned = await familyAssignedToLeaders(c.env.DB, resolved.family_key, ids, c.get('workspace')!.id)
     if (!assigned) return c.json({ error: 'Family is not assigned to you' }, 403)
     teamLeaderId = assigned
   }
 
-  const current = await c.env.DB.prepare('SELECT * FROM family_geotags WHERE family_key = ?')
-    .bind(resolved.family_key)
+  const current = await c.env.DB.prepare('SELECT * FROM family_geotags WHERE workspace_id = ? AND family_key = ?')
+    .bind(c.get('workspace')!.id, resolved.family_key)
     .first<{
       family_key: string
       lat: number
@@ -453,19 +461,21 @@ field.post('/api/field/geotags', requireUser, async (c) => {
 
   const now = new Date().toISOString()
   const place = await c.env.DB.prepare(
-    'SELECT place_club_id FROM family_place_clubs WHERE family_head_epic = ?',
+    'SELECT place_club_id FROM family_place_clubs WHERE workspace_id = ? AND family_head_epic = ?',
   )
-    .bind(resolved.family_key)
+    .bind(c.get('workspace')!.id, resolved.family_key)
     .first<{ place_club_id: string }>()
 
   if (current) {
     await c.env.DB.prepare(
       `INSERT INTO family_geotag_history
-        (id, family_key, lat, lng, accuracy_m, altitude, tagged_at, tagged_by, team_leader_id, source, note, address, client_event_id, place_club_id, replaced_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, org_id, workspace_id, family_key, lat, lng, accuracy_m, altitude, tagged_at, tagged_by, team_leader_id, source, note, address, client_event_id, place_club_id, replaced_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         crypto.randomUUID(),
+        c.get('workspace')!.org_id,
+        c.get('workspace')!.id,
         current.family_key,
         current.lat,
         current.lng,
@@ -487,7 +497,7 @@ field.post('/api/field/geotags', requireUser, async (c) => {
       `UPDATE family_geotags
        SET lat = ?, lng = ?, accuracy_m = ?, altitude = ?, tagged_at = ?, tagged_by = ?,
            team_leader_id = ?, source = ?, note = ?, address = ?, client_event_id = ?, place_club_id = ?, updated_at = ?
-       WHERE family_key = ?`,
+       WHERE workspace_id = ? AND family_key = ?`,
     )
       .bind(
         body.lat,
@@ -503,16 +513,19 @@ field.post('/api/field/geotags', requireUser, async (c) => {
         body.event_id,
         place?.place_club_id ?? current.place_club_id,
         now,
+        c.get('workspace')!.id,
         resolved.family_key,
       )
       .run()
   } else {
     await c.env.DB.prepare(
       `INSERT INTO family_geotags
-        (family_key, lat, lng, accuracy_m, altitude, tagged_at, tagged_by, team_leader_id, source, note, address, client_event_id, place_club_id, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (org_id, workspace_id, family_key, lat, lng, accuracy_m, altitude, tagged_at, tagged_by, team_leader_id, source, note, address, client_event_id, place_club_id, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
+        c.get('workspace')!.org_id,
+        c.get('workspace')!.id,
         resolved.family_key,
         body.lat,
         body.lng,
@@ -531,7 +544,7 @@ field.post('/api/field/geotags', requireUser, async (c) => {
       .run()
   }
 
-  await logActivity(c.env, profile.id, current ? 'family_geotag_update' : 'family_geotag', 'family_geotags', resolved.family_key, {
+  await logActivity(c.env, c.get('workspace'), profile.id, current ? 'family_geotag_update' : 'family_geotag', 'family_geotags', resolved.family_key, {
     lat: body.lat,
     lng: body.lng,
     accuracy_m: body.accuracy_m,
@@ -539,18 +552,18 @@ field.post('/api/field/geotags', requireUser, async (c) => {
     address: body.address ?? null,
   })
 
-  const geotag = await c.env.DB.prepare('SELECT * FROM family_geotags WHERE family_key = ?')
-    .bind(resolved.family_key)
+  const geotag = await c.env.DB.prepare('SELECT * FROM family_geotags WHERE workspace_id = ? AND family_key = ?')
+    .bind(c.get('workspace')!.id, resolved.family_key)
     .first()
   return c.json({ ok: true, geotag }, current ? 200 : 201)
 })
 
-field.delete('/api/field/geotags/:familyKey', requireUser, requireAdmin, async (c) => {
+field.delete('/api/field/geotags/:familyKey', requireUser, requireWorkspace, requireAdmin, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   const familyKey = decodeURIComponent(c.req.param('familyKey') ?? '')
-  const current = await c.env.DB.prepare('SELECT * FROM family_geotags WHERE family_key = ?')
-    .bind(familyKey)
+  const current = await c.env.DB.prepare('SELECT * FROM family_geotags WHERE workspace_id = ? AND family_key = ?')
+    .bind(c.get('workspace')!.id, familyKey)
     .first<{
       family_key: string
       lat: number
@@ -571,11 +584,13 @@ field.delete('/api/field/geotags/:familyKey', requireUser, requireAdmin, async (
   const now = new Date().toISOString()
   await c.env.DB.prepare(
     `INSERT INTO family_geotag_history
-      (id, family_key, lat, lng, accuracy_m, altitude, tagged_at, tagged_by, team_leader_id, source, note, address, client_event_id, place_club_id, replaced_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      (id, org_id, workspace_id, family_key, lat, lng, accuracy_m, altitude, tagged_at, tagged_by, team_leader_id, source, note, address, client_event_id, place_club_id, replaced_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       crypto.randomUUID(),
+      c.get('workspace')!.org_id,
+      c.get('workspace')!.id,
       current.family_key,
       current.lat,
       current.lng,
@@ -593,7 +608,9 @@ field.delete('/api/field/geotags/:familyKey', requireUser, requireAdmin, async (
     )
     .run()
 
-  await c.env.DB.prepare('DELETE FROM family_geotags WHERE family_key = ?').bind(familyKey).run()
-  await logActivity(c.env, profile.id, 'family_geotag_clear', 'family_geotags', familyKey, null)
+  await c.env.DB.prepare('DELETE FROM family_geotags WHERE workspace_id = ? AND family_key = ?')
+    .bind(c.get('workspace')!.id, familyKey)
+    .run()
+  await logActivity(c.env, c.get('workspace'), profile.id, 'family_geotag_clear', 'family_geotags', familyKey, null)
   return c.json({ success: true })
 })

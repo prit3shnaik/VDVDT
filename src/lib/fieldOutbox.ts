@@ -11,7 +11,9 @@ export interface FieldOutboxItem {
   last_error?: string
 }
 
-const QUEUE_KEY = 'field:outbox:v1'
+import { workspaceScopedKey } from './workspace'
+
+const QUEUE_KEY = workspaceScopedKey('field:outbox:v1')
 const LISTENERS = new Set<() => void>()
 
 function notify() {

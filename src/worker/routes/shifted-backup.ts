@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { Env } from '../env'
-import { requireUser, type AuthedVars } from '../middleware/auth'
+import { requireUser, requireWorkspace, type AuthedVars } from '../middleware/auth'
 import { ensureVotersSchema } from '../lib/schema-ensure'
 
 export const shiftedBackup = new Hono<{ Bindings: Env; Variables: AuthedVars }>()
@@ -18,14 +18,15 @@ function csvEscape(value: unknown): string {
   return text
 }
 
-shiftedBackup.post('/api/shifted-parking-backup', requireUser, async (c) => {
+shiftedBackup.post('/api/shifted-parking-backup', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
+  const workspace = c.get('workspace')!
   if (!canWrite(profile)) return c.json({ error: 'Forbidden' }, 403)
 
   await ensureVotersSchema(c.env.DB)
   const db = c.env.DB
 
-  const existingCountRow = await db.prepare('SELECT COUNT(*) AS n FROM shifted_parking_backup').first<{ n: number }>()
+  const existingCountRow = await db.prepare('SELECT COUNT(*) AS n FROM shifted_parking_backup WHERE workspace_id = ?').bind(workspace.id).first<{ n: number }>()
   const existingCount = Number(existingCountRow?.n ?? 0)
   if (existingCount > 0) {
     return c.json({
@@ -37,8 +38,8 @@ shiftedBackup.post('/api/shifted-parking-backup', requireUser, async (c) => {
   }
 
   const { results: leaders } = await db.prepare(
-    `SELECT * FROM team_leaders WHERE notes IN (?, ?)`,
-  ).bind(OFFICE_NOTES_MARKER, SHIFTED_NOTES_MARKER).all<Record<string, unknown>>()
+    `SELECT * FROM team_leaders WHERE workspace_id = ? AND (bucket_code IN (?, ?) OR notes IN (?, ?))`,
+  ).bind(workspace.id, OFFICE_NOTES_MARKER, SHIFTED_NOTES_MARKER, OFFICE_NOTES_MARKER, SHIFTED_NOTES_MARKER).all<Record<string, unknown>>()
 
   const parkingLeaders = leaders ?? []
   const leaderIds = parkingLeaders.map((row) => String(row.id ?? '')).filter(Boolean)
@@ -53,8 +54,8 @@ shiftedBackup.post('/api/shifted-parking-backup', requireUser, async (c) => {
             v.id AS voter_row_id
      FROM team_leader_assignments a
      JOIN voters v ON v.id = a.voter_id
-     WHERE a.team_leader_id IN (${placeholders})`,
-  ).bind(...leaderIds).all<Record<string, unknown>>()
+     WHERE a.workspace_id = ? AND a.team_leader_id IN (${placeholders})`,
+  ).bind(workspace.id, ...leaderIds).all<Record<string, unknown>>()
 
   const liveRows = assignments ?? []
   const liveCount = liveRows.length
@@ -67,12 +68,14 @@ shiftedBackup.post('/api/shifted-parking-backup', requireUser, async (c) => {
     const parkingKind = notes === OFFICE_NOTES_MARKER ? 'shifted' : 'single'
     return db.prepare(
       `INSERT INTO shifted_parking_backup (
-        id, backed_up_at, parking_kind, leader_id, leader_notes, leader_created_at,
+        id, org_id, workspace_id, backed_up_at, parking_kind, leader_id, leader_notes, leader_created_at,
         voter_id, epic_no, voter_name, family_head_epic, ward_no, part_no, section, parked_address,
         assignment_id, assigned_at, assigned_by, is_direct, raw_leader_json, raw_voter_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       crypto.randomUUID(),
+      workspace.org_id,
+      workspace.id,
       backedUpAt,
       parkingKind,
       String(row.team_leader_id),
@@ -99,7 +102,7 @@ shiftedBackup.post('/api/shifted-parking-backup', requireUser, async (c) => {
     await db.batch(statements)
   }
 
-  const backupCountRow = await db.prepare('SELECT COUNT(*) AS n FROM shifted_parking_backup').first<{ n: number }>()
+  const backupCountRow = await db.prepare('SELECT COUNT(*) AS n FROM shifted_parking_backup WHERE workspace_id = ?').bind(workspace.id).first<{ n: number }>()
   const backupCount = Number(backupCountRow?.n ?? 0)
   if (backupCount !== liveCount) {
     return c.json({
@@ -117,8 +120,8 @@ shiftedBackup.post('/api/shifted-parking-backup', requireUser, async (c) => {
            WHEN presence_note IS NULL OR TRIM(presence_note) = '' THEN ?
            ELSE presence_note
          END
-         WHERE id = ?`,
-      ).bind(String(row.parked_address), String(row.voter_id)),
+         WHERE workspace_id = ? AND id = ?`,
+      ).bind(String(row.parked_address), workspace.id, String(row.voter_id)),
     )
   if (copyStatements.length) {
     await db.batch(copyStatements)
@@ -127,15 +130,15 @@ shiftedBackup.post('/api/shifted-parking-backup', requireUser, async (c) => {
   return c.json({ ok: true, alreadyBackedUp: false, backupCount, liveCount })
 })
 
-shiftedBackup.get('/api/shifted-parking-backup', requireUser, async (c) => {
+shiftedBackup.get('/api/shifted-parking-backup', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
   if (profile.role !== 'admin' && profile.role !== 'sub-admin') return c.json({ error: 'Forbidden' }, 403)
   await ensureVotersSchema(c.env.DB)
 
   const format = (new URL(c.req.url).searchParams.get('format') ?? 'json').toLowerCase()
   const { results } = await c.env.DB.prepare(
-    'SELECT * FROM shifted_parking_backup ORDER BY backed_up_at, parking_kind, leader_id',
-  ).all<Record<string, unknown>>()
+    'SELECT * FROM shifted_parking_backup WHERE workspace_id = ? ORDER BY backed_up_at, parking_kind, leader_id',
+  ).bind(c.get('workspace')!.id).all<Record<string, unknown>>()
   const rows = results ?? []
 
   if (format === 'csv') {

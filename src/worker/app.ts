@@ -1,6 +1,9 @@
 import { Hono } from 'hono'
 import { createAuth } from './auth'
 import { requireUser, type AuthedVars } from './middleware/auth'
+import { platformDb } from './env'
+import { listCategories, listPresenceOptions } from './lib/workspace-config'
+import { platform } from './routes/platform'
 import { photos } from './routes/photos'
 import { media } from './routes/media'
 import { voterDuplicates } from './routes/voter-duplicates'
@@ -28,6 +31,7 @@ export const app = new Hono<{ Bindings: Env; Variables: AuthedVars }>()
 
 // Bootstrap endpoint (no session required; guarded by ADMIN_SETUP_PIN)
 app.route('/', authBootstrap)
+app.route('/', platform)
 
 // SECURITY: Better Auth exposes public self-registration by default. Accounts here are
 // created by an admin (or by bootstrap), never by strangers, so the public sign-up and
@@ -43,9 +47,40 @@ app.on(['GET', 'POST'], '/api/auth/*', (c) => {
   return auth.handler(c.req.raw)
 })
 
-// Joins the Better Auth session to the app's `users` profile row.
-app.get('/api/me', requireUser, (c) => {
-  return c.json({ user: c.get('authUser'), profile: c.get('profile') })
+// Joins the Better Auth session to the platform user, active workspace and
+// workspace configuration. The browser never invents workspace membership.
+app.get('/api/me', requireUser, async (c) => {
+  const workspace = c.get('workspace')
+  const db = platformDb(c.env)
+  let org = null
+  let settings = null
+  let categories: unknown[] = []
+  let presenceOptions: unknown[] = []
+
+  if (workspace) {
+    org = await db
+      .prepare('SELECT id, name, slug, status, display_name, plan_id FROM orgs WHERE id = ?')
+      .bind(workspace.org_id)
+      .first()
+    settings = await db
+      .prepare('SELECT branding, presence_options, special_leader_buckets, print_templates, product_display_name FROM workspace_settings WHERE workspace_id = ?')
+      .bind(workspace.id)
+      .first()
+    categories = await listCategories(db, workspace.id)
+    presenceOptions = await listPresenceOptions(db, workspace.id)
+  }
+
+  return c.json({
+    user: c.get('authUser'),
+    profile: c.get('profile'),
+    platformUser: c.get('platformUser'),
+    memberships: c.get('memberships'),
+    workspace,
+    org,
+    settings,
+    categories,
+    presenceOptions,
+  })
 })
 
 app.route('/', photos)

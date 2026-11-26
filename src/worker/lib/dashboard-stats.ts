@@ -3,13 +3,20 @@ import { ensureVotersSchema } from './schema-ensure'
 import { ACTIVE_VOTER_SQL } from './voter-active'
 
 /**
- * Recomputes the singleton `dashboard_stats` row (id = 1).
- * Shared by POST /api/dashboard-stats/refresh and the `refresh_dashboard_stats` RPC
- * so the two cannot drift apart.
+ * Recomputes the `dashboard_stats` row for one workspace.
+ * Shared by POST /api/dashboard-stats/refresh and the `refresh_dashboard_stats`
+ * RPC so the two cannot drift apart. A missing workspace is a programming
+ * error: the stats row is per workspace, never global.
  */
-export async function refreshDashboardStats(db: D1Database): Promise<string> {
+export async function refreshDashboardStats(
+  db: D1Database,
+  workspaceId: string,
+  orgId: string,
+): Promise<string> {
+  if (!workspaceId || !orgId) throw new Error('refreshDashboardStats requires workspaceId and orgId')
   await ensureVotersSchema(db)
   const now = new Date().toISOString()
+  const where = `workspace_id = ? AND ${ACTIVE_VOTER_SQL}`
 
   const totals = await db
     .prepare(
@@ -19,20 +26,21 @@ export async function refreshDashboardStats(db: D1Database): Promise<string> {
               SUM(CASE WHEN gender = 'OTHER' THEN 1 ELSE 0 END) AS other,
               COALESCE(AVG(age), 0) AS avg_age
        FROM voters
-       WHERE ${ACTIVE_VOTER_SQL}`
+       WHERE ${where}`,
     )
+    .bind(workspaceId)
     .first<{ total: number; male: number; female: number; other: number; avg_age: number }>()
 
   const toJsonBreakdown = async (sql: string) => {
-    const { results } = await db.prepare(sql).all<{ k: string; c: number }>()
+    const { results } = await db.prepare(sql).bind(workspaceId).all<{ k: string; c: number }>()
     return JSON.stringify(Object.fromEntries((results ?? []).map((r) => [r.k, r.c])))
   }
 
   const religionBreakdown = await toJsonBreakdown(
-    `SELECT COALESCE(NULLIF(religion, ''), 'UNKNOWN') AS k, COUNT(*) AS c FROM voters WHERE ${ACTIVE_VOTER_SQL} GROUP BY 1`
+    `SELECT COALESCE(NULLIF(religion, ''), 'UNKNOWN') AS k, COUNT(*) AS c FROM voters WHERE ${where} GROUP BY 1`,
   )
   const partBreakdown = await toJsonBreakdown(
-    `SELECT COALESCE(CAST(part_no AS TEXT), 'UNKNOWN') AS k, COUNT(*) AS c FROM voters WHERE ${ACTIVE_VOTER_SQL} GROUP BY 1`
+    `SELECT COALESCE(CAST(part_no AS TEXT), 'UNKNOWN') AS k, COUNT(*) AS c FROM voters WHERE ${where} GROUP BY 1`,
   )
   const ageBandBreakdown = await toJsonBreakdown(
     `SELECT CASE
@@ -43,19 +51,20 @@ export async function refreshDashboardStats(db: D1Database): Promise<string> {
        WHEN age BETWEEN 51 AND 65 THEN '51-65'
        ELSE '66+'
      END AS k, COUNT(*) AS c
-      FROM voters WHERE ${ACTIVE_VOTER_SQL} GROUP BY 1`
+      FROM voters WHERE ${where} GROUP BY 1`,
   )
   const birthdayMonthBreakdown = await toJsonBreakdown(
     `SELECT printf('%02d', CAST(strftime('%m', date_of_birth) AS INTEGER)) AS k, COUNT(*) AS c
-     FROM voters WHERE date_of_birth IS NOT NULL AND ${ACTIVE_VOTER_SQL} GROUP BY 1`
+     FROM voters WHERE date_of_birth IS NOT NULL AND ${where} GROUP BY 1`,
   )
 
   await db
     .prepare(
-      `INSERT INTO dashboard_stats (id, total_voters, male_count, female_count, other_count, avg_age,
+      `INSERT INTO dashboard_stats (workspace_id, org_id, total_voters, male_count, female_count, other_count, avg_age,
          religion_breakdown, part_breakdown, age_band_breakdown, birthday_month_breakdown, refreshed_at)
-       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(workspace_id) DO UPDATE SET
+         org_id = excluded.org_id,
          total_voters = excluded.total_voters,
          male_count = excluded.male_count,
          female_count = excluded.female_count,
@@ -65,9 +74,11 @@ export async function refreshDashboardStats(db: D1Database): Promise<string> {
          part_breakdown = excluded.part_breakdown,
          age_band_breakdown = excluded.age_band_breakdown,
          birthday_month_breakdown = excluded.birthday_month_breakdown,
-         refreshed_at = excluded.refreshed_at`
+         refreshed_at = excluded.refreshed_at`,
     )
     .bind(
+      workspaceId,
+      orgId,
       totals?.total ?? 0,
       totals?.male ?? 0,
       totals?.female ?? 0,
@@ -77,7 +88,7 @@ export async function refreshDashboardStats(db: D1Database): Promise<string> {
       partBreakdown,
       ageBandBreakdown,
       birthdayMonthBreakdown,
-      now
+      now,
     )
     .run()
 

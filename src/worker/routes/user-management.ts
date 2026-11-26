@@ -1,173 +1,170 @@
 import { Hono } from 'hono'
 import type { Env } from '../env'
+import { platformDb } from '../env'
 import { linkCredential } from '../lib/link-credential'
-import { requireUser, requireAdmin, type AuthedVars } from '../middleware/auth'
+import { requireUser, requireAdmin, requireWorkspace, type AuthedVars } from '../middleware/auth'
 
 export const userManagement = new Hono<{ Bindings: Env; Variables: AuthedVars }>()
 
-const ROLES = ['admin', 'sub-admin', 'user'] as const
-type Role = (typeof ROLES)[number]
+const WORKSPACE_ROLES = ['candidate', 'incharge', 'operator', 'booth_agent', 'field'] as const
+type WorkspaceRole = (typeof WORKSPACE_ROLES)[number]
 
-interface UserRow {
-  id: string
-  auth_user_id: string
-  full_name: string | null
+interface MemberRow {
+  membership_id: string
+  user_id: string
   email: string
-  role: Role
+  full_name: string | null
+  role: WorkspaceRole
   allowed_wards: string
   can_edit: number
-  password_reset_required: number
   created_at: string
 }
 
-function shape(row: UserRow) {
+function shape(row: MemberRow) {
+  let wards: number[]
+  try {
+    const parsed = JSON.parse(row.allowed_wards)
+    wards = Array.isArray(parsed) ? parsed.map(Number).filter(Number.isInteger) : []
+  } catch {
+    wards = []
+  }
   return {
-    ...row,
-    allowed_wards: JSON.parse(row.allowed_wards) as number[],
+    id: row.user_id,
+    membership_id: row.membership_id,
+    email: row.email,
+    full_name: row.full_name,
+    role: row.role,
+    allowed_wards: wards,
     can_edit: Boolean(row.can_edit),
-    password_reset_required: Boolean(row.password_reset_required),
+    created_at: row.created_at,
   }
 }
 
 function normalizeWards(value: unknown): string | null {
   if (!Array.isArray(value)) return null
-  const wards = value.map(Number).filter((n) => Number.isInteger(n))
-  return JSON.stringify(wards)
+  return JSON.stringify(value.map(Number).filter((n) => Number.isInteger(n)))
 }
 
-userManagement.get('/api/admin/users', requireUser, requireAdmin, async (c) => {
+async function mirrorUser(env: Env, userId: string, email: string, fullName: string | null): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO users (id, email, full_name, synced_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET email = excluded.email, full_name = excluded.full_name, synced_at = excluded.synced_at`,
+  )
+    .bind(userId, email, fullName, new Date().toISOString())
+    .run()
+    .catch(() => {})
+}
+
+// ---------------------------------------------------------------------------
+// Workspace members (not platform identity). A user can belong to many
+// workspaces; this route manages the membership for the active workspace only.
+// ---------------------------------------------------------------------------
+userManagement.get('/api/admin/users', requireUser, requireWorkspace, requireAdmin, async (c) => {
+  const workspace = c.get('workspace')!
   const url = new URL(c.req.url)
   const limit = Math.min(Number(url.searchParams.get('limit') ?? 100) || 100, 500)
   const offset = Math.max(Number(url.searchParams.get('offset') ?? 0) || 0, 0)
 
-  const { results } = await c.env.DB.prepare(
-    `SELECT id, auth_user_id, full_name, email, role, allowed_wards, can_edit, password_reset_required, created_at
-     FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?`
-  )
-    .bind(limit, offset)
-    .all<UserRow>()
+  const { results } = await platformDb(c.env)
+    .prepare(
+      `SELECT m.id AS membership_id, m.user_id, u.email, u.full_name, m.role,
+              m.allowed_wards, m.can_edit, m.created_at
+       FROM workspace_members m
+       JOIN users u ON u.id = m.user_id
+       WHERE m.workspace_id = ?
+       ORDER BY m.created_at ASC LIMIT ? OFFSET ?`,
+    )
+    .bind(workspace.id, limit, offset)
+    .all<MemberRow>()
 
   return c.json({ users: (results ?? []).map(shape) })
 })
 
-userManagement.get('/api/admin/users/:id', requireUser, requireAdmin, async (c) => {
-  const user = await c.env.DB.prepare(
-    `SELECT id, auth_user_id, full_name, email, role, allowed_wards, can_edit, password_reset_required, created_at
-     FROM users WHERE id = ?`
-  )
-    .bind(c.req.param('id'))
-    .first<UserRow>()
-
-  if (!user) return c.json({ error: 'Not found' }, 404)
-  return c.json({ user: shape(user) })
-})
-
-/**
- * Creates the Better Auth account and the app profile together.
- * Password hashing is owned by Better Auth — never hash by hand here, or
- * sign-in verification will not match.
- */
-userManagement.post('/api/admin/users', requireUser, requireAdmin, async (c) => {
-  const actor = c.get('profile')
+userManagement.post('/api/admin/users', requireUser, requireWorkspace, requireAdmin, async (c) => {
+  const workspace = c.get('workspace')!
+  const db = platformDb(c.env)
   const body = await c.req.json<{
     email?: string
     password?: string
     fullName?: string
-    role?: Role
+    role?: WorkspaceRole
     allowedWards?: number[]
     canEdit?: boolean
   }>()
 
   const email = body.email?.toLowerCase().trim()
-  if (!email || !body.password) {
-    return c.json({ error: 'email and password are required' }, 400)
-  }
-  if (body.password.length < 8) {
+  if (!email) return c.json({ error: 'email is required' }, 400)
+  if (body.password && body.password.length < 8) {
     return c.json({ error: 'Password must be at least 8 characters' }, 400)
   }
 
-  const role: Role = body.role && ROLES.includes(body.role) ? body.role : 'user'
-  // Only a full admin may mint another admin; sub-admins cannot escalate.
-  if (role === 'admin' && actor.role !== 'admin') {
-    return c.json({ error: 'Only an admin can create an admin' }, 403)
-  }
-
-  const existing = await c.env.DB.prepare('SELECT id, auth_user_id FROM users WHERE email = ?')
-    .bind(email)
-    .first<{ id: string; auth_user_id: string }>()
-
+  const role: WorkspaceRole = body.role && WORKSPACE_ROLES.includes(body.role) ? body.role : 'operator'
   const displayName = body.fullName?.trim() || email.split('@')[0]
 
+  const existing = await db
+    .prepare('SELECT id, email, full_name FROM users WHERE email = ?')
+    .bind(email)
+    .first<{ id: string; email: string; full_name: string | null }>()
+
   try {
-    // A migrated profile can exist with no usable password (Supabase hashes could not be
-    // migrated). In that case, attach a credential to it instead of refusing as duplicate.
+    let userId: string
     if (existing) {
-      const hasCredential = await c.env.DB.prepare(
-        'SELECT a.id FROM account a JOIN [user] u ON u.id = a.userId WHERE u.email = ? AND a.password IS NOT NULL'
-      )
-        .bind(email)
-        .first()
-
-      if (hasCredential) {
-        return c.json({ error: 'A user with this email already exists' }, 400)
-      }
-
+      userId = existing.id
+      if (body.password) await linkCredential(c.env, email, body.password, displayName)
+    } else {
+      if (!body.password) return c.json({ error: 'password is required for a new user' }, 400)
       const { authUserId } = await linkCredential(c.env, email, body.password, displayName)
-      await c.env.DB.prepare(
-        'UPDATE users SET auth_user_id = ?, full_name = ?, password_reset_required = 1, updated_at = ? WHERE id = ?'
-      )
-        .bind(authUserId, displayName, new Date().toISOString(), existing.id)
+      userId = crypto.randomUUID()
+      const now = new Date().toISOString()
+      await db
+        .prepare(
+          `INSERT INTO users (id, auth_user_id, full_name, email, is_platform_admin, password_reset_required, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 0, 1, ?, ?)`,
+        )
+        .bind(userId, authUserId, displayName, email, now, now)
         .run()
-
-      return c.json({ id: existing.id, email, role, linked: true }, 201)
     }
 
-    const { authUserId } = await linkCredential(c.env, email, body.password, displayName)
-
-    const id = crypto.randomUUID()
-    const now = new Date().toISOString()
-
-    await c.env.DB.prepare(
-      `INSERT INTO users (id, auth_user_id, full_name, email, role, allowed_wards, can_edit, password_reset_required, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
-    )
+    await db
+      .prepare(
+        `INSERT INTO workspace_members (id, org_id, workspace_id, user_id, role, allowed_wards, can_edit, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(workspace_id, user_id) DO UPDATE SET
+           role = excluded.role, allowed_wards = excluded.allowed_wards,
+           can_edit = excluded.can_edit, updated_at = excluded.updated_at`,
+      )
       .bind(
-        id,
-        authUserId,
-        displayName,
-        email,
+        crypto.randomUUID(),
+        workspace.org_id,
+        workspace.id,
+        userId,
         role,
         normalizeWards(body.allowedWards) ?? '[]',
-        body.canEdit ? 1 : 0,
-        now,
-        now
+        body.canEdit === false || role === 'field' || role === 'booth_agent' ? 0 : 1,
+        new Date().toISOString(),
+        new Date().toISOString(),
       )
       .run()
 
-    return c.json({ id, email, role }, 201)
+    await mirrorUser(c.env, userId, email, existing?.full_name ?? displayName)
+    return c.json({ id: userId, email, role }, 201)
   } catch (err) {
-    console.error('Create user error:', err)
-    return c.json({ error: err instanceof Error ? err.message : 'Failed to create user' }, 500)
+    console.error('Create member error:', err)
+    return c.json({ error: err instanceof Error ? err.message : 'Failed to create member' }, 500)
   }
 })
 
-userManagement.patch('/api/admin/users/:id', requireUser, requireAdmin, async (c) => {
+userManagement.patch('/api/admin/users/:id', requireUser, requireWorkspace, requireAdmin, async (c) => {
+  const workspace = c.get('workspace')!
   const actor = c.get('profile')
-  const id = c.req.param('id')
+  const userId = c.req.param('id')
+  const db = platformDb(c.env)
 
-  // Prevents an admin locking themselves out or self-escalating.
-  if (id === actor.id) {
-    return c.json({ error: 'Cannot edit your own permissions' }, 400)
-  }
-
-  const target = await c.env.DB.prepare('SELECT id, role FROM users WHERE id = ?')
-    .bind(id)
-    .first<{ id: string; role: Role }>()
-  if (!target) return c.json({ error: 'Not found' }, 404)
+  if (userId === actor.id) return c.json({ error: 'Cannot edit your own membership' }, 400)
 
   const body = await c.req.json<{
     fullName?: string
-    role?: Role
+    role?: WorkspaceRole
     allowedWards?: number[]
     canEdit?: boolean
   }>()
@@ -175,63 +172,60 @@ userManagement.patch('/api/admin/users/:id', requireUser, requireAdmin, async (c
   const updates: string[] = []
   const values: unknown[] = []
 
-  if (body.fullName !== undefined) {
-    updates.push('full_name = ?')
-    values.push(body.fullName?.trim() || null)
-  }
-
   if (body.role !== undefined) {
-    if (!ROLES.includes(body.role)) {
-      return c.json({ error: `role must be one of ${ROLES.join(', ')}` }, 400)
-    }
-    // Only a full admin may grant or revoke admin.
-    if ((body.role === 'admin' || target.role === 'admin') && actor.role !== 'admin') {
-      return c.json({ error: 'Only an admin can change admin role' }, 403)
-    }
-    if (target.role === 'admin' && body.role !== 'admin') {
-      const row = await c.env.DB.prepare(
-        "SELECT COUNT(*) AS count FROM users WHERE role = 'admin'"
-      ).first<{ count: number }>()
-      if ((row?.count ?? 0) <= 1) return c.json({ error: 'Cannot demote the last admin' }, 400)
+    if (!WORKSPACE_ROLES.includes(body.role)) {
+      return c.json({ error: `role must be one of ${WORKSPACE_ROLES.join(', ')}` }, 400)
     }
     updates.push('role = ?')
     values.push(body.role)
   }
-
   if (body.allowedWards !== undefined) {
     const wards = normalizeWards(body.allowedWards)
     if (wards === null) return c.json({ error: 'allowedWards must be an array of numbers' }, 400)
     updates.push('allowed_wards = ?')
     values.push(wards)
   }
-
   if (body.canEdit !== undefined) {
     updates.push('can_edit = ?')
     values.push(body.canEdit ? 1 : 0)
   }
 
-  if (updates.length === 0) return c.json({ success: true })
+  if (updates.length) {
+    updates.push('updated_at = ?')
+    values.push(new Date().toISOString(), workspace.id, userId)
+    await db
+      .prepare(`UPDATE workspace_members SET ${updates.join(', ')} WHERE workspace_id = ? AND user_id = ?`)
+      .bind(...values)
+      .run()
+  }
 
-  updates.push('updated_at = ?')
-  values.push(new Date().toISOString(), id)
+  if (body.fullName !== undefined) {
+    await db
+      .prepare('UPDATE users SET full_name = ?, updated_at = ? WHERE id = ?')
+      .bind(body.fullName?.trim() || null, new Date().toISOString(), userId)
+      .run()
+  }
 
-  await c.env.DB.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).bind(...values).run()
   return c.json({ success: true })
 })
 
-/** Resets another user's password. Better Auth owns the hashing. */
-userManagement.post('/api/admin/users/:id/password', requireUser, requireAdmin, async (c) => {
-  const actor = c.get('profile')
-  const id = c.req.param('id')
+/** Resets a member's password. Better Auth owns the hashing. */
+userManagement.post('/api/admin/users/:id/password', requireUser, requireWorkspace, requireAdmin, async (c) => {
+  const workspace = c.get('workspace')!
+  const userId = c.req.param('id')
+  const db = platformDb(c.env)
 
-  const target = await c.env.DB.prepare('SELECT id, auth_user_id, email, full_name, role FROM users WHERE id = ?')
-    .bind(id)
-    .first<{ id: string; auth_user_id: string; email: string; full_name: string | null; role: Role }>()
+  const member = await db
+    .prepare('SELECT user_id FROM workspace_members WHERE workspace_id = ? AND user_id = ?')
+    .bind(workspace.id, userId)
+    .first()
+  if (!member) return c.json({ error: 'Not found' }, 404)
+
+  const target = await db
+    .prepare('SELECT id, email, full_name FROM users WHERE id = ?')
+    .bind(userId)
+    .first<{ id: string; email: string; full_name: string | null }>()
   if (!target) return c.json({ error: 'Not found' }, 404)
-
-  if (target.role === 'admin' && actor.role !== 'admin') {
-    return c.json({ error: 'Only an admin can reset an admin password' }, 403)
-  }
 
   const { password } = await c.req.json<{ password?: string }>()
   if (!password || password.length < 8) {
@@ -239,16 +233,11 @@ userManagement.post('/api/admin/users/:id/password', requireUser, requireAdmin, 
   }
 
   try {
-    // linkCredential creates the credential if the profile never had one (migrated user),
-    // otherwise it resets the password. Either way Better Auth owns the hashing.
-    const { authUserId } = await linkCredential(c.env, target.email, password, target.full_name ?? target.email)
-
-    await c.env.DB.prepare(
-      'UPDATE users SET auth_user_id = ?, password_reset_required = 1, updated_at = ? WHERE id = ?'
-    )
-      .bind(authUserId, new Date().toISOString(), id)
+    await linkCredential(c.env, target.email, password, target.full_name ?? target.email)
+    await db
+      .prepare('UPDATE users SET password_reset_required = 1, updated_at = ? WHERE id = ?')
+      .bind(new Date().toISOString(), userId)
       .run()
-
     return c.json({ success: true })
   } catch (err) {
     console.error('Password reset error:', err)
@@ -256,74 +245,18 @@ userManagement.post('/api/admin/users/:id/password', requireUser, requireAdmin, 
   }
 })
 
-userManagement.delete('/api/admin/users/:id', requireUser, requireAdmin, async (c) => {
+/** Removes a member from this workspace. The platform account is kept. */
+userManagement.delete('/api/admin/users/:id', requireUser, requireWorkspace, requireAdmin, async (c) => {
+  const workspace = c.get('workspace')!
   const actor = c.get('profile')
-  const id = c.req.param('id')
+  const userId = c.req.param('id')
 
-  if (id === actor.id) {
-    return c.json({ error: 'Cannot delete yourself' }, 400)
-  }
+  if (userId === actor.id) return c.json({ error: 'Cannot remove yourself' }, 400)
 
-  const target = await c.env.DB.prepare('SELECT id, auth_user_id, role FROM users WHERE id = ?')
-    .bind(id)
-    .first<{ id: string; auth_user_id: string; role: Role }>()
-  if (!target) return c.json({ error: 'Not found' }, 404)
-
-  if (target.role === 'admin' && actor.role !== 'admin') {
-    return c.json({ error: 'Only an admin can delete an admin' }, 403)
-  }
-  if (target.role === 'admin') {
-    const row = await c.env.DB.prepare(
-      "SELECT COUNT(*) AS count FROM users WHERE role = 'admin'"
-    ).first<{ count: number }>()
-    if ((row?.count ?? 0) <= 1) return c.json({ error: 'Cannot delete the last admin' }, 400)
-  }
-
-  try {
-    await c.env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS saved_filter_presets (
-        id TEXT PRIMARY KEY,
-        owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        name TEXT NOT NULL,
-        filters TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-        UNIQUE (owner_id, name)
-      )
-    `).run()
-
-    await c.env.DB.batch([
-      c.env.DB.prepare('UPDATE voters SET updated_by = NULL WHERE updated_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE import_batches SET imported_by = NULL WHERE imported_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE custom_fields SET updated_by = NULL WHERE updated_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE family_merge_events SET merged_by = NULL WHERE merged_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE groups SET created_by = NULL WHERE created_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE group_members SET added_by = NULL WHERE added_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE team_leaders SET created_by = NULL WHERE created_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE team_leader_assignments SET assigned_by = NULL WHERE assigned_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE meetings SET created_by = NULL WHERE created_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE meeting_invitees SET updated_by = NULL WHERE updated_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE job_records SET created_by = NULL, updated_by = NULL WHERE created_by = ? OR updated_by = ?').bind(id, id),
-      c.env.DB.prepare('UPDATE activity_logs SET actor_user_id = NULL WHERE actor_user_id = ?').bind(id),
-      c.env.DB.prepare('UPDATE place_clubs SET created_by = NULL WHERE created_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE elections SET created_by = NULL WHERE created_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE booth_agents SET assigned_by = NULL WHERE assigned_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE team_leader_users SET assigned_by = NULL WHERE assigned_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE app_settings SET updated_by = NULL WHERE updated_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE voter_turnout SET overridden_by = NULL WHERE overridden_by = ?').bind(id),
-      c.env.DB.prepare('UPDATE voter_turnout SET marked_by = ? WHERE marked_by = ?').bind(actor.id, id),
-      c.env.DB.prepare('UPDATE family_geotags SET tagged_by = ? WHERE tagged_by = ?').bind(actor.id, id),
-      c.env.DB.prepare('DELETE FROM booth_agents WHERE user_id = ?').bind(id),
-      c.env.DB.prepare('DELETE FROM team_leader_users WHERE user_id = ?').bind(id),
-      c.env.DB.prepare('DELETE FROM saved_filter_presets WHERE owner_id = ?').bind(id),
-      c.env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id),
-      c.env.DB.prepare('DELETE FROM session WHERE userId = ?').bind(target.auth_user_id),
-      c.env.DB.prepare('DELETE FROM account WHERE userId = ?').bind(target.auth_user_id),
-      c.env.DB.prepare('DELETE FROM [user] WHERE id = ?').bind(target.auth_user_id),
-    ])
-  } catch (err) {
-    console.error('Delete user error:', err)
-    return c.json({ error: err instanceof Error ? err.message : 'Failed to delete user' }, 500)
-  }
+  await platformDb(c.env)
+    .prepare('DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?')
+    .bind(workspace.id, userId)
+    .run()
 
   return c.json({ success: true })
 })

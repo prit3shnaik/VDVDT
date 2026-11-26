@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { Env } from '../env'
-import { requireUser, wardFilter, type AuthedVars } from '../middleware/auth'
+import { requireUser, requireWorkspace, wardFilter, type AuthedVars } from '../middleware/auth'
 
 export const jobRecords = new Hono<{ Bindings: Env; Variables: AuthedVars }>()
 
@@ -18,7 +18,7 @@ function canWrite(profile: AuthedVars['profile']): boolean {
 }
 
 // Job records hang off a voter, so they inherit that voter's ward ACL.
-jobRecords.get('/api/job-records', requireUser, async (c) => {
+jobRecords.get('/api/job-records', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
   const url = new URL(c.req.url)
   const limit = Math.min(Number(url.searchParams.get('limit') ?? 100) || 100, 500)
@@ -26,9 +26,9 @@ jobRecords.get('/api/job-records', requireUser, async (c) => {
   const status = url.searchParams.get('status')
   const voterId = url.searchParams.get('voter_id')
 
-  const { clause, params } = wardFilter(profile)
-  const conditions = [clause.replaceAll('ward_no', 'v.ward_no')]
-  const sqlParams: unknown[] = [...params]
+  const { clause, params } = wardFilter(profile, 'v')
+  const conditions = [clause, 'j.workspace_id = ?']
+  const sqlParams: unknown[] = [...params, c.get('workspace')!.id]
 
   if (status) {
     if (!JOB_STATUSES.includes(status as JobStatus)) {
@@ -56,15 +56,15 @@ jobRecords.get('/api/job-records', requireUser, async (c) => {
   return c.json({ jobRecords: results ?? [] })
 })
 
-jobRecords.get('/api/job-records/:id', requireUser, async (c) => {
+jobRecords.get('/api/job-records/:id', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
-  const { clause, params } = wardFilter(profile)
+  const { clause, params } = wardFilter(profile, 'v')
 
   const job = await c.env.DB.prepare(
     `SELECT j.*, v.name, v.epic_no, v.ward_no, v.part_no
      FROM job_records j
      JOIN voters v ON v.id = j.voter_id
-     WHERE j.id = ? AND ${clause.replaceAll('ward_no', 'v.ward_no')}`
+     WHERE j.id = ? AND ${clause}`
   )
     .bind(c.req.param('id'), ...params)
     .first()
@@ -73,8 +73,9 @@ jobRecords.get('/api/job-records/:id', requireUser, async (c) => {
   return c.json({ job })
 })
 
-jobRecords.post('/api/job-records', requireUser, async (c) => {
+jobRecords.post('/api/job-records', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
+  const workspace = c.get('workspace')!
   if (!canWrite(profile)) return c.json({ error: 'Forbidden' }, 403)
 
   const body = await c.req.json<{
@@ -100,11 +101,13 @@ jobRecords.post('/api/job-records', requireUser, async (c) => {
   const now = new Date().toISOString()
 
   await c.env.DB.prepare(
-    `INSERT INTO job_records (id, voter_id, status, department_name, note, created_by, updated_by, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO job_records (id, org_id, workspace_id, voter_id, status, department_name, note, created_by, updated_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
       id,
+      workspace.org_id,
+      workspace.id,
       body.voter_id,
       body.status,
       body.department_name?.trim() || null,
@@ -119,17 +122,17 @@ jobRecords.post('/api/job-records', requireUser, async (c) => {
   return c.json({ id }, 201)
 })
 
-jobRecords.patch('/api/job-records/:id', requireUser, async (c) => {
+jobRecords.patch('/api/job-records/:id', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
   if (!canWrite(profile)) return c.json({ error: 'Forbidden' }, 403)
 
   const id = c.req.param('id')
-  const { clause, params } = wardFilter(profile)
+  const { clause, params } = wardFilter(profile, 'v')
   const existing = await c.env.DB.prepare(
     `SELECT j.id FROM job_records j JOIN voters v ON v.id = j.voter_id
-     WHERE j.id = ? AND ${clause.replaceAll('ward_no', 'v.ward_no')}`
+     WHERE j.id = ? AND j.workspace_id = ? AND ${clause}`
   )
-    .bind(id, ...params)
+    .bind(id, c.get('workspace')!.id, ...params)
     .first()
   if (!existing) return c.json({ error: 'Not found' }, 404)
 
@@ -163,26 +166,28 @@ jobRecords.patch('/api/job-records/:id', requireUser, async (c) => {
   updates.push('updated_by = ?', 'updated_at = ?')
   values.push(profile.id, new Date().toISOString(), id)
 
-  await c.env.DB.prepare(`UPDATE job_records SET ${updates.join(', ')} WHERE id = ?`)
-    .bind(...values)
+  await c.env.DB.prepare(`UPDATE job_records SET ${updates.join(', ')} WHERE workspace_id = ? AND id = ?`)
+    .bind(...values.slice(0, -1), c.get('workspace')!.id, values[values.length - 1])
     .run()
 
   return c.json({ success: true })
 })
 
-jobRecords.delete('/api/job-records/:id', requireUser, async (c) => {
+jobRecords.delete('/api/job-records/:id', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
   if (!canWrite(profile)) return c.json({ error: 'Forbidden' }, 403)
 
   const { clause, params } = wardFilter(profile)
   const existing = await c.env.DB.prepare(
     `SELECT j.id FROM job_records j JOIN voters v ON v.id = j.voter_id
-     WHERE j.id = ? AND ${clause.replaceAll('ward_no', 'v.ward_no')}`
+     WHERE j.id = ? AND ${clause}`
   )
     .bind(c.req.param('id'), ...params)
     .first()
   if (!existing) return c.json({ error: 'Not found' }, 404)
 
-  await c.env.DB.prepare('DELETE FROM job_records WHERE id = ?').bind(c.req.param('id')).run()
+  await c.env.DB.prepare('DELETE FROM job_records WHERE workspace_id = ? AND id = ?')
+    .bind(c.get('workspace')!.id, c.req.param('id'))
+    .run()
   return c.json({ success: true })
 })

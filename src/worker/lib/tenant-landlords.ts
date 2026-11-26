@@ -1,5 +1,5 @@
 import type { D1Database } from '@cloudflare/workers-types'
-import { wardFilter, type AuthedVars } from '../middleware/auth'
+import { wardFilter, workspaceFilter, type AuthedVars } from '../middleware/auth'
 import { activeVoterSql } from './voter-active'
 
 export type Profile = AuthedVars['profile']
@@ -65,55 +65,80 @@ export function normalizeEpic(value: unknown): string {
   return typeof value === 'string' ? value.trim().toUpperCase() : ''
 }
 
+/**
+ * Landlord scope: workspace first (on the landlord row), then the ward ACL for
+ * non-admin roles. An off-roll landlord has no voter, so its own ward is used.
+ * Callers must join `voters v ON v.id = l.voter_id`.
+ */
 export function landlordWardClause(profile: Profile): { clause: string; params: unknown[] } {
-  const { clause, params } = wardFilter(profile)
-  if (clause === '1=1') return { clause: '1=1', params: [] }
+  const ws = workspaceFilter(profile, 'l')
+  const admin = profile.is_platform_admin
+    || profile.workspace_role === 'candidate'
+    || profile.workspace_role === 'incharge'
+  if (admin) return ws
 
-  const voterClause = clause.replaceAll('ward_no', 'v.ward_no')
-  const landlordClause = clause.replaceAll('ward_no', 'l.ward_no')
+  const wards = profile.allowed_wards.length > 0 ? profile.allowed_wards : [-1]
+  const placeholders = wards.map(() => '?').join(',')
   return {
-    clause: `(l.voter_id IS NULL OR ${voterClause}) AND (l.voter_id IS NOT NULL OR l.ward_no IS NULL OR ${landlordClause})`,
-    params: [...params, ...params],
+    clause: `${ws.clause} AND (
+      (l.voter_id IS NULL AND (l.ward_no IS NULL OR l.ward_no IN (${placeholders})))
+      OR (l.voter_id IS NOT NULL AND (v.ward_no IS NULL OR v.ward_no IN (${placeholders})))
+    )`,
+    params: [...ws.params, ...wards, ...wards],
   }
 }
 
 export function tenantWardClause(profile: Profile, alias: string): { clause: string; params: unknown[] } {
-  const { clause, params } = wardFilter(profile)
-  return { clause: clause.replaceAll('ward_no', `${alias}.ward_no`), params }
+  return wardFilter(profile, alias)
 }
 
-export async function loadVotersByIds(db: D1Database, ids: string[]): Promise<Map<string, VoterRow>> {
+export async function loadVotersByIds(
+  db: D1Database,
+  ids: string[],
+  workspaceId?: string,
+): Promise<Map<string, VoterRow>> {
   const unique = Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean)))
   const map = new Map<string, VoterRow>()
   for (let i = 0; i < unique.length; i += D1_CHUNK) {
     const chunk = unique.slice(i, i + D1_CHUNK)
+    const scope = workspaceId ? ' AND workspace_id = ?' : ''
     const { results } = await db
-      .prepare(`SELECT * FROM voters WHERE id IN (${chunk.map(() => '?').join(',')})`)
-      .bind(...chunk)
+      .prepare(`SELECT * FROM voters WHERE id IN (${chunk.map(() => '?').join(',')})${scope}`)
+      .bind(...chunk, ...(workspaceId ? [workspaceId] : []))
       .all<VoterRow>()
     for (const row of results ?? []) map.set(row.id, row)
   }
   return map
 }
 
-export async function loadVotersByEpics(db: D1Database, epics: string[]): Promise<Map<string, VoterRow>> {
+export async function loadVotersByEpics(
+  db: D1Database,
+  epics: string[],
+  workspaceId?: string,
+): Promise<Map<string, VoterRow>> {
   const unique = Array.from(new Set(epics.map((epic) => epic.trim()).filter(Boolean)))
   const map = new Map<string, VoterRow>()
   for (let i = 0; i < unique.length; i += D1_CHUNK) {
     const chunk = unique.slice(i, i + D1_CHUNK)
+    const scope = workspaceId ? ' AND workspace_id = ?' : ''
     const { results } = await db
-      .prepare(`SELECT * FROM voters WHERE epic_no IN (${chunk.map(() => '?').join(',')})`)
-      .bind(...chunk)
+      .prepare(`SELECT * FROM voters WHERE epic_no IN (${chunk.map(() => '?').join(',')})${scope}`)
+      .bind(...chunk, ...(workspaceId ? [workspaceId] : []))
       .all<VoterRow>()
     for (const row of results ?? []) map.set(row.epic_no, row)
   }
   return map
 }
 
-export async function attachVoters(db: D1Database, landlords: LandlordRow[]): Promise<LandlordWithVoter[]> {
+export async function attachVoters(
+  db: D1Database,
+  landlords: LandlordRow[],
+  workspaceId?: string,
+): Promise<LandlordWithVoter[]> {
   const voters = await loadVotersByIds(
     db,
     landlords.map((landlord) => landlord.voter_id).filter((id): id is string => Boolean(id)),
+    workspaceId,
   )
   return landlords.map((landlord) => ({
     ...landlord,
@@ -121,16 +146,21 @@ export async function attachVoters(db: D1Database, landlords: LandlordRow[]): Pr
   }))
 }
 
-export async function loadLandlordsByIds(db: D1Database, ids: string[]): Promise<Map<string, LandlordWithVoter>> {
+export async function loadLandlordsByIds(
+  db: D1Database,
+  ids: string[],
+  workspaceId?: string,
+): Promise<Map<string, LandlordWithVoter>> {
   const unique = Array.from(new Set(ids.filter(Boolean)))
   const map = new Map<string, LandlordWithVoter>()
   for (let i = 0; i < unique.length; i += D1_CHUNK) {
     const chunk = unique.slice(i, i + D1_CHUNK)
+    const scope = workspaceId ? ' AND workspace_id = ?' : ''
     const { results } = await db
-      .prepare(`SELECT * FROM landlords WHERE id IN (${chunk.map(() => '?').join(',')})`)
-      .bind(...chunk)
+      .prepare(`SELECT * FROM landlords WHERE id IN (${chunk.map(() => '?').join(',')})${scope}`)
+      .bind(...chunk, ...(workspaceId ? [workspaceId] : []))
       .all<LandlordRow>()
-    const withVoters = await attachVoters(db, results ?? [])
+    const withVoters = await attachVoters(db, results ?? [], workspaceId)
     for (const row of withVoters) map.set(row.id, row)
   }
   return map
@@ -145,13 +175,13 @@ export async function loadScopedLandlord(
   const row = await db
     .prepare(`
       SELECT l.* FROM landlords l
-      LEFT JOIN voters v ON v.id = l.voter_id
+      LEFT JOIN voters v ON v.id = l.voter_id AND v.workspace_id = l.workspace_id
       WHERE l.id = ? AND ${clause}
     `)
     .bind(id, ...params)
     .first<LandlordRow>()
   if (!row) return null
-  const [withVoter] = await attachVoters(db, [row])
+  const [withVoter] = await attachVoters(db, [row], profile.workspace_id ?? undefined)
   return withVoter ?? null
 }
 
@@ -166,7 +196,7 @@ export async function loadTenantCounts(db: D1Database, profile: Profile): Promis
         COALESCE(SUM(CASE WHEN l.voter_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS on_roll,
         COALESCE(SUM(CASE WHEN l.voter_id IS NULL THEN 1 ELSE 0 END), 0) AS off_roll
       FROM landlords l
-      LEFT JOIN voters v ON v.id = l.voter_id
+      LEFT JOIN voters v ON v.id = l.voter_id AND v.workspace_id = l.workspace_id
       WHERE ${landlordWard.clause}
     `)
     .bind(...landlordWard.params)
@@ -176,9 +206,9 @@ export async function loadTenantCounts(db: D1Database, profile: Profile): Promis
     .prepare(`
       SELECT COUNT(*) AS tenants
       FROM tenant_links t
-      JOIN landlords l ON l.id = t.landlord_id
-      LEFT JOIN voters v ON v.id = l.voter_id
-      JOIN voters te ON te.epic_no = t.tenant_epic
+      JOIN landlords l ON l.id = t.landlord_id AND l.workspace_id = t.workspace_id
+      LEFT JOIN voters v ON v.id = l.voter_id AND v.workspace_id = l.workspace_id
+      JOIN voters te ON te.epic_no = t.tenant_epic AND te.workspace_id = t.workspace_id
       WHERE ${activeVoterSql('te')}
         AND ${tenantWard.clause}
         AND ${landlordWard.clause}
@@ -192,7 +222,10 @@ export async function loadTenantCounts(db: D1Database, profile: Profile): Promis
       SELECT COUNT(*) AS c FROM voters v
       WHERE ${activeVoterSql('v')}
         AND ${voterWard.clause}
-        AND NOT EXISTS (SELECT 1 FROM tenant_links t WHERE t.tenant_epic = v.epic_no)
+        AND NOT EXISTS (
+          SELECT 1 FROM tenant_links t
+          WHERE t.tenant_epic = v.epic_no AND t.workspace_id = v.workspace_id
+        )
     `)
     .bind(...voterWard.params)
     .first<{ c: number }>()
@@ -237,10 +270,14 @@ export async function queryVoterCandidates(
     params.push(options.excludeVoterId)
   }
   if (options.excludeTenants) {
-    conditions.push('NOT EXISTS (SELECT 1 FROM tenant_links t WHERE t.tenant_epic = v.epic_no)')
+    conditions.push(
+      'NOT EXISTS (SELECT 1 FROM tenant_links t WHERE t.tenant_epic = v.epic_no AND t.workspace_id = v.workspace_id)',
+    )
   }
   if (options.excludeLandlords) {
-    conditions.push('NOT EXISTS (SELECT 1 FROM landlords l WHERE l.voter_id = v.id)')
+    conditions.push(
+      'NOT EXISTS (SELECT 1 FROM landlords l WHERE l.voter_id = v.id AND l.workspace_id = v.workspace_id)',
+    )
   }
   if (options.ward != null) {
     conditions.push('v.ward_no = ?')

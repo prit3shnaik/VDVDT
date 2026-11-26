@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import type { Env } from '../env'
-import { requireUser, wardFilter, type AuthedVars } from '../middleware/auth'
+import { requireUser, requireWorkspace, wardFilter, type AuthedVars } from '../middleware/auth'
+import { assertCategoryCode, assertPresenceCode } from '../lib/workspace-config'
 import { logActivity } from './activity-logs'
 import { refreshDashboardStats } from '../lib/dashboard-stats'
 import { ensureVotersSchema } from '../lib/schema-ensure'
@@ -29,10 +30,10 @@ function canWrite(profile: AuthedVars['profile']): boolean {
   return profile.role === 'admin' || profile.role === 'sub-admin' || profile.can_edit
 }
 
-async function epicTaken(db: Env['DB'], epic: string, excludeId?: string): Promise<boolean> {
+async function epicTaken(db: Env['DB'], epic: string, workspaceId: string, excludeId?: string): Promise<boolean> {
   const row = excludeId
-    ? await db.prepare('SELECT id FROM voters WHERE epic_no = ? AND id <> ? LIMIT 1').bind(epic, excludeId).first()
-    : await db.prepare('SELECT id FROM voters WHERE epic_no = ? LIMIT 1').bind(epic).first()
+    ? await db.prepare('SELECT id FROM voters WHERE workspace_id = ? AND epic_no = ? AND id <> ? LIMIT 1').bind(workspaceId, epic, excludeId).first()
+    : await db.prepare('SELECT id FROM voters WHERE workspace_id = ? AND epic_no = ? LIMIT 1').bind(workspaceId, epic).first()
   return Boolean(row)
 }
 
@@ -41,10 +42,11 @@ async function epicTaken(db: Env['DB'], epic: string, excludeId?: string): Promi
  * Clients cache the full roll locally and call this to decide whether a refetch is
  * needed, turning a ~16k-row revalidation into a single row read.
  */
-voters.get('/api/voters/version', requireUser, async (c) => {
+voters.get('/api/voters/version', requireUser, requireWorkspace, async (c) => {
+  const workspace = c.get('workspace')!
   const row = await c.env.DB.prepare(
-    "SELECT version, row_count, updated_at FROM dataset_version WHERE table_name = 'voters'"
-  ).first<{ version: number; row_count: number; updated_at: string }>()
+    "SELECT version, row_count, updated_at FROM dataset_version WHERE workspace_id = ? AND table_name = 'voters'"
+  ).bind(workspace.id).first<{ version: number; row_count: number; updated_at: string }>()
 
   return c.json(
     { version: row?.version ?? 0, rowCount: row?.row_count ?? 0, updatedAt: row?.updated_at ?? null },
@@ -54,7 +56,7 @@ voters.get('/api/voters/version', requireUser, async (c) => {
 })
 
 // List/search voters. Ward ACL applied server-side; the SPA no longer pulls the whole table.
-voters.get('/api/voters', requireUser, async (c) => {
+voters.get('/api/voters', requireUser, requireWorkspace, async (c) => {
   await ensureVotersSchema(c.env.DB)
   const profile = c.get('profile')
   const url = new URL(c.req.url)
@@ -64,35 +66,42 @@ voters.get('/api/voters', requireUser, async (c) => {
   const ward = url.searchParams.get('ward')
   const part = url.searchParams.get('part')
 
-  const { clause: wardClause, params: wardParams } = wardFilter(profile)
   const includeInactive = url.searchParams.get('include_inactive') === '1'
-  const conditions = [wardClause]
-  const params: unknown[] = [...wardParams]
-  if (!includeInactive) conditions.push(ACTIVE_VOTER_SQL)
-
-  if (ward) {
-    conditions.push('ward_no = ?')
-    params.push(Number(ward))
-  }
-  if (part) {
-    conditions.push('part_no = ?')
-    params.push(Number(part))
-  }
+  const plainScope = wardFilter(profile)
+  const aliasedScope = wardFilter(profile, 'v')
 
   let sql: string
+  let params: unknown[]
   if (q) {
     // FTS5 prefix match; quote to keep user input from being parsed as MATCH syntax.
     const matchQuery = `"${q.replaceAll('"', '""')}"*`
-    const ftsWhere = conditions
-      .join(' AND ')
-      .replaceAll('ward_no', 'v.ward_no')
-      .replaceAll('part_no', 'v.part_no')
-      .replaceAll('is_active', 'v.is_active')
+    const conditions = [aliasedScope.clause]
+    params = [...aliasedScope.params]
+    if (!includeInactive) conditions.push('v.is_active IS NOT 0')
+    if (ward) {
+      conditions.push('v.ward_no = ?')
+      params.push(Number(ward))
+    }
+    if (part) {
+      conditions.push('v.part_no = ?')
+      params.push(Number(part))
+    }
     sql = `SELECT v.* FROM voters v JOIN voters_fts f ON f.rowid = v.rowid
-           WHERE voters_fts MATCH ? AND ${ftsWhere}
+           WHERE voters_fts MATCH ? AND ${conditions.join(' AND ')}
            ORDER BY v.updated_at DESC LIMIT ? OFFSET ?`
     params.unshift(matchQuery)
   } else {
+    const conditions = [plainScope.clause]
+    params = [...plainScope.params]
+    if (!includeInactive) conditions.push(ACTIVE_VOTER_SQL)
+    if (ward) {
+      conditions.push('ward_no = ?')
+      params.push(Number(ward))
+    }
+    if (part) {
+      conditions.push('part_no = ?')
+      params.push(Number(part))
+    }
     sql = `SELECT * FROM voters WHERE ${conditions.join(' AND ')}
            ORDER BY updated_at DESC LIMIT ? OFFSET ?`
   }
@@ -286,8 +295,9 @@ const WRITABLE_COLUMNS = [
   'presence_status', 'presence_note', 'is_active', 'disabled_at', 'disabled_reason',
 ] as const
 
-voters.post('/api/voters', requireUser, async (c) => {
+voters.post('/api/voters', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
+  const workspace = c.get('workspace')!
   if (!canWrite(profile)) return c.json({ error: 'Forbidden' }, 403)
 
   const body = await c.req.json<Record<string, unknown>>()
@@ -295,15 +305,17 @@ voters.post('/api/voters', requireUser, async (c) => {
 
   const epic = String(body.epic_no).trim()
   if (!epic) return c.json({ error: 'epic_no and name are required' }, 400)
-  if (await epicTaken(c.env.DB, epic)) {
-    return c.json({ error: `EPIC number ${epic} already belongs to another voter.` }, 409)
+  if (await epicTaken(c.env.DB, epic, workspace.id)) {
+    return c.json({ error: `EPIC number ${epic} already belongs to another voter in this workspace.` }, 409)
   }
   body.epic_no = epic
+  await assertCategoryCode(c.env.PLATFORM_DB ?? c.env.DB, workspace.id, body.voter_category)
+  await assertPresenceCode(c.env.PLATFORM_DB ?? c.env.DB, workspace.id, body.presence_status)
 
   const id = crypto.randomUUID()
   const now = new Date().toISOString()
-  const cols = ['id', ...WRITABLE_COLUMNS, 'created_at', 'updated_at', 'updated_by']
-  const values = [id, ...WRITABLE_COLUMNS.map((col) => body[col] ?? null), now, now, profile.id]
+  const cols = ['id', 'org_id', 'workspace_id', ...WRITABLE_COLUMNS, 'created_at', 'updated_at', 'updated_by']
+  const values = [id, workspace.org_id, workspace.id, ...WRITABLE_COLUMNS.map((col) => body[col] ?? null), now, now, profile.id]
   const placeholders = cols.map(() => '?').join(',')
 
   try {
@@ -311,7 +323,7 @@ voters.post('/api/voters', requireUser, async (c) => {
       .bind(...values)
       .run()
   } catch (err) {
-    if (String(err).includes('UNIQUE constraint failed: voters.epic_no')) {
+    if (String(err).includes('UNIQUE constraint failed: voters.workspace_id, voters.epic_no')) {
       return c.json({ error: `EPIC number ${epic} already belongs to another voter.` }, 409)
     }
     throw err
@@ -337,7 +349,7 @@ voters.patch('/api/voters/:id', requireUser, async (c) => {
   if (updates.includes('epic_no')) {
     const epic = String(body.epic_no ?? '').trim()
     if (!epic) return c.json({ error: 'epic_no is required' }, 400)
-    if (await epicTaken(c.env.DB, epic, c.req.param('id'))) {
+    if (await epicTaken(c.env.DB, epic, c.get('workspace')!.id, c.req.param('id'))) {
       return c.json({ error: `EPIC number ${epic} already belongs to another voter.` }, 409)
     }
     body.epic_no = epic
@@ -350,7 +362,7 @@ voters.patch('/api/voters/:id', requireUser, async (c) => {
   try {
     await c.env.DB.prepare(`UPDATE voters SET ${setClause} WHERE id = ?`).bind(...values).run()
   } catch (err) {
-    if (String(err).includes('UNIQUE constraint failed: voters.epic_no')) {
+    if (String(err).includes('UNIQUE constraint failed: voters.workspace_id, voters.epic_no')) {
       return c.json({ error: 'That EPIC number already belongs to another voter.' }, 409)
     }
     throw err
@@ -370,7 +382,7 @@ voters.post('/api/voters/bulk-delete/preview', requireUser, async (c) => {
   }
 
   await ensureVotersSchema(c.env.DB)
-  const plan = await planBulkDelete(c.env.DB, epics)
+  const plan = await planBulkDelete(c.env.DB, epics, wardFilter(profile))
   return c.json(previewPayload(plan))
 })
 
@@ -386,12 +398,12 @@ voters.post('/api/voters/bulk-delete', requireUser, async (c) => {
   }
 
   await ensureVotersSchema(c.env.DB)
-  const plan = await planBulkDelete(c.env.DB, epics)
+  const plan = await planBulkDelete(c.env.DB, epics, wardFilter(profile))
   if (!plan.deleteCount) return c.json({ error: 'None of those EPICs were found.' }, 404)
 
   await executeBulkDelete(c.env.DB, c.env.PHOTOS, plan)
-  await refreshDashboardStats(c.env.DB)
-  await logActivity(c.env, profile.id, 'bulk_delete_epics', 'voters', null, {
+  await refreshDashboardStats(c.env.DB, profile.workspace_id!, profile.org_id!)
+  await logActivity(c.env, c.get('workspace'), profile.id, 'bulk_delete_epics', 'voters', null, {
     requested: plan.requested,
     deleted: plan.deleteCount,
     wholeFamilies: plan.wholeFamilies,
@@ -416,7 +428,7 @@ voters.post('/api/voters/bulk-disable/preview', requireUser, async (c) => {
   }
 
   await ensureVotersSchema(c.env.DB)
-  const plan = await planBulkDisable(c.env.DB, epics)
+  const plan = await planBulkDisable(c.env.DB, epics, wardFilter(profile))
   return c.json(disablePreviewPayload(plan, 'disable'))
 })
 
@@ -432,13 +444,13 @@ voters.post('/api/voters/bulk-disable', requireUser, async (c) => {
   }
 
   await ensureVotersSchema(c.env.DB)
-  const plan = await planBulkDisable(c.env.DB, epics)
+  const plan = await planBulkDisable(c.env.DB, epics, wardFilter(profile))
   if (!plan.toChange.length) return c.json({ error: 'None of those EPICs are active.' }, 404)
 
   const reason = typeof body.reason === 'string' && body.reason.trim() ? body.reason.trim().slice(0, 200) : 'Removed from electoral roll'
   await executeBulkDisable(c.env.DB, plan.toChange.map((row) => row.id), reason, profile.id)
-  await refreshDashboardStats(c.env.DB)
-  await logActivity(c.env, profile.id, 'bulk_disable_epics', 'voters', null, {
+  await refreshDashboardStats(c.env.DB, profile.workspace_id!, profile.org_id!)
+  await logActivity(c.env, c.get('workspace'), profile.id, 'bulk_disable_epics', 'voters', null, {
     requested: plan.requested,
     disabled: plan.toChange.length,
     alreadyDisabled: plan.alreadyDisabled.length,
@@ -462,7 +474,7 @@ voters.post('/api/voters/bulk-enable/preview', requireUser, async (c) => {
   }
 
   await ensureVotersSchema(c.env.DB)
-  const plan = await planBulkEnable(c.env.DB, epics)
+  const plan = await planBulkEnable(c.env.DB, epics, wardFilter(profile))
   return c.json(disablePreviewPayload(plan, 'enable'))
 })
 
@@ -478,12 +490,12 @@ voters.post('/api/voters/bulk-enable', requireUser, async (c) => {
   }
 
   await ensureVotersSchema(c.env.DB)
-  const plan = await planBulkEnable(c.env.DB, epics)
+  const plan = await planBulkEnable(c.env.DB, epics, wardFilter(profile))
   if (!plan.toChange.length) return c.json({ error: 'None of those EPICs are disabled.' }, 404)
 
   await executeBulkEnable(c.env.DB, plan.toChange.map((row) => row.id), profile.id)
-  await refreshDashboardStats(c.env.DB)
-  await logActivity(c.env, profile.id, 'bulk_enable_epics', 'voters', null, {
+  await refreshDashboardStats(c.env.DB, profile.workspace_id!, profile.org_id!)
+  await logActivity(c.env, c.get('workspace'), profile.id, 'bulk_enable_epics', 'voters', null, {
     requested: plan.requested,
     enabled: plan.toChange.length,
     alreadyActive: plan.alreadyDisabled.length,
@@ -503,6 +515,9 @@ voters.delete('/api/voters', requireUser, async (c) => {
   const part = url.searchParams.get('part')
   if (!part) return c.json({ error: 'part query param is required' }, 400)
 
-  const result = await c.env.DB.prepare('DELETE FROM voters WHERE part_no = ?').bind(Number(part)).run()
+  const workspace = c.get('workspace')!
+  const result = await c.env.DB.prepare('DELETE FROM voters WHERE workspace_id = ? AND part_no = ?')
+    .bind(workspace.id, Number(part))
+    .run()
   return c.json({ deleted: result.meta.changes })
 })

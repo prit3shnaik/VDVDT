@@ -1,10 +1,10 @@
 import { betterAuth } from 'better-auth'
 import { admin } from 'better-auth/plugins'
-import type { Env } from './env'
+import { platformDb, type Env } from './env'
 
-// Better Auth owns `user` / `session` / `account` / `verification` only.
-// The app profile (role, allowed_wards, can_edit) lives in the separate `users` table,
-// joined by `users.auth_user_id = user.id`. Do not merge the two.
+// Better Auth owns `user` / `session` / `account` / `verification` only, and
+// those live in the platform database. Tenancy (orgs/workspaces/memberships)
+// is a separate model; never merge it into the auth tables.
 export function createAuth(env: Env) {
   // Better Auth rejects any request whose Origin is not trusted, so every hostname the
   // app is reachable on must be listed (custom domain, pages.dev, local dev).
@@ -16,7 +16,7 @@ export function createAuth(env: Env) {
     .filter(Boolean)
 
   return betterAuth({
-    database: env.DB,
+    database: platformDb(env),
     secret: env.BETTER_AUTH_SECRET,
     baseURL: env.APP_ORIGIN,
     emailAndPassword: {

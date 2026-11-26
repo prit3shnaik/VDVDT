@@ -214,8 +214,13 @@ function MoreSheetRow({ item, onClose }: { item: NavItem; onClose: () => void })
   )
 }
 
+function membershipRoleLabel(memberships: Array<{ workspace: { id: string }; role: string }>, workspaceId: string): string {
+  const role = memberships.find((m) => m.workspace.id === workspaceId)?.role ?? 'member'
+  return role.replaceAll('_', ' ')
+}
+
 export function AppLayout() {
-  const { profile, signOut, isAdminAreaAllowed } = useAuth()
+  const { profile, signOut, isAdminAreaAllowed, workspace, memberships, switchWorkspace, productDisplayName, loading } = useAuth()
   const fieldAccess = useFieldAccess()
   const pendingSync = useFieldOutboxCount()
   const [mobileOpen, setMobileOpen] = useState(false)
@@ -262,6 +267,12 @@ export function AppLayout() {
   }, [])
 
   const fieldHome = visibleWorkspace[0]?.path
+
+  useEffect(() => {
+    if (!loading && !workspace && memberships.length === 0) {
+      navigate('/onboarding', { replace: true })
+    }
+  }, [loading, workspace, memberships.length, navigate])
 
   useEffect(() => {
     if (!fieldOnly || fieldAccess.loading || !fieldHome) return
@@ -326,8 +337,33 @@ export function AppLayout() {
             <span className="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-[image:var(--kpi-hairline)] text-sm font-semibold text-white shadow-sm">
               V
             </span>
-            <span className="truncate font-display text-[15px] font-semibold tracking-[-0.02em] text-ink">VoterData</span>
+            <span className="truncate font-display text-[15px] font-semibold tracking-[-0.02em] text-ink">{productDisplayName}</span>
           </Link>
+
+          {memberships.length > 0 && (
+            <div className="px-3 pb-3">
+              <label className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.12em] text-ink-muted">
+                Workspace
+              </label>
+              <select
+                value={workspace?.id ?? ''}
+                onChange={(event) => switchWorkspace(event.target.value)}
+                className="w-full rounded-lg border border-line bg-white px-2.5 py-2 text-[13px] font-medium text-ink shadow-sm focus:border-accent focus:outline-none"
+                aria-label="Switch constituency workspace"
+              >
+                {memberships.map((membership) => (
+                  <option key={membership.workspace.id} value={membership.workspace.id}>
+                    {membership.workspace.name}
+                  </option>
+                ))}
+              </select>
+              {workspace && (
+                <p className="mt-1 truncate text-[11px] text-ink-muted">
+                  {workspace.name} · {membershipRoleLabel(memberships, workspace.id)}
+                </p>
+              )}
+            </div>
+          )}
 
           <nav className="min-h-0 flex-1 space-y-5 overflow-y-auto px-3 pb-6 pt-1">
             {groupedNav.map((group) => (
