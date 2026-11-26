@@ -1,0 +1,98 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #f4f6fb;
+  --bg-elevated: #ffffff;
+  --bg-muted: #eef1f8;
+  --bg-sunken: #e6ebf5;
+  --ink: #0c1424;
+  --ink-secondary: #3a4760;
+  --ink-tertiary: #6a7892;
+  --line: #e2e8f4;
+  --line-strong: #c9d3e6;
+  --shell: var(--bg);
+  --brand-50: #eef2ff;
+  --brand-100: #e0e7ff;
+  --brand-200: #c7d2fe;
+  --brand-500: #4f46e5;
+  --brand-600: #4338ca;
+  --brand-700: #3730a3;
+  --accent-50: var(--brand-50);
+  --accent-100: var(--brand-100);
+  --accent-500: var(--brand-500);
+  --accent-700: var(--brand-700);
+  --success: #047857;
+  --success-fill: #ecfdf5;
+  --success-border: #a7f3d0;
+  --warning: #b45309;
+  --warning-fill: #fffbeb;
+  --warning-border: #fde68a;
+  --danger: #b91c1c;
+  --danger-fill: #fef2f2;
+  --danger-border: #fecaca;
+  --info: #1d4ed8;
+  --info-fill: #eff6ff;
+  --info-border: #bfdbfe;
+  --wash: linear-gradient(160deg, #eef2ff 0%, #e8edff 38%, #e4f0ff 100%);
+  --kpi-hairline: linear-gradient(90deg, #4f46e5, #2563eb 62%, #0ea5e9);
+  --surface-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 10px 24px -16px rgba(37, 56, 110, 0.18);
+  --surface-shadow-hover: 0 1px 2px rgba(15, 23, 42, 0.05), 0 16px 32px -18px rgba(37, 56, 110, 0.28);
+  --inset-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Inter, 'Segoe UI', sans-serif;
+  font-feature-settings: 'tnum';
+  background:
+    radial-gradient(1200px 420px at 0% -10%, rgba(79, 70, 229, 0.07), transparent 55%),
+    radial-gradient(900px 360px at 100% 0%, rgba(37, 99, 235, 0.05), transparent 50%),
+    var(--bg);
+  color: var(--ink);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+@layer components {
+  .surface-card {
+    @apply rounded-xl border border-line bg-white;
+    box-shadow: var(--surface-shadow);
+  }
+
+  .surface-panel {
+    @apply overflow-hidden rounded-xl border border-line bg-white;
+    box-shadow: var(--surface-shadow);
+  }
+
+  .filter-bar {
+    @apply rounded-xl border border-line bg-white;
+    box-shadow: var(--surface-shadow);
+  }
+
+  .chart-shell {
+    @apply overflow-hidden rounded-xl border border-line bg-white;
+    box-shadow: var(--surface-shadow);
+  }
+
+  .table-head {
+    background: linear-gradient(180deg, #f8faff 0%, #eef2f9 100%);
+  }
+
+  .data-row {
+    @apply transition-colors;
+  }
+
+  .data-row:hover {
+    background: #f5f7fd;
+  }
+}
