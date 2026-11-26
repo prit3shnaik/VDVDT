@@ -2,6 +2,7 @@ import { Navigate, Outlet, createBrowserRouter } from 'react-router-dom'
 import { useAuth } from '../hooks/useAuth'
 import { AppLayout } from './layouts/AppLayout'
 import { LoginPage } from '../pages/auth/LoginPage'
+import { OnboardingPage } from '../pages/platform/OnboardingPage'
 import { DashboardPage } from '../pages/workspace/DashboardPage'
 import { VotersPage } from '../pages/workspace/VotersPage'
 import { DisabledVotersPage } from '../pages/workspace/DisabledVotersPage'
@@ -89,6 +90,10 @@ export const router = createBrowserRouter(
     {
     element: <RequireAuth />,
     children: [
+      {
+        path: '/onboarding',
+        element: <OnboardingPage />,
+      },
       {
         element: <AppLayout />,
         children: [

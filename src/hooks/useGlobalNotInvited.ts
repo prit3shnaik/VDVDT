@@ -5,7 +5,9 @@ import { buildWardScope } from '../lib/voterCache'
 import { useAuth } from './useAuth'
 import { fetchInvitedAnywhereVoterIds, fetchVotersForScope } from './useMeetingData'
 
-export const GLOBAL_NOT_INVITED_CACHE_KEY = 'vote:global-not-invited:voters-cache'
+import { workspaceScopedKey } from '../lib/workspace'
+
+export const GLOBAL_NOT_INVITED_CACHE_KEY = workspaceScopedKey('vote:global-not-invited:voters-cache')
 
 export interface GlobalNotInvitedData {
   loading: boolean

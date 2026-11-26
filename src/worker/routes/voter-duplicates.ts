@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { Env } from '../env'
-import { requireUser, wardFilter, type AuthedVars } from '../middleware/auth'
+import { requireUser, requireWorkspace, wardFilter, type AuthedVars } from '../middleware/auth'
 import { ensureVotersSchema } from '../lib/schema-ensure'
 import { groupDuplicateVoters, parseDuplicateMode } from '../lib/voter-duplicates'
 
@@ -35,7 +35,7 @@ function matchesQuery(row: Record<string, unknown>, tokens: string[]): boolean {
   return tokens.every((token) => haystack.includes(token))
 }
 
-voterDuplicates.get('/api/voters/duplicates', requireUser, async (c) => {
+voterDuplicates.get('/api/voters/duplicates', requireUser, requireWorkspace, async (c) => {
   await ensureVotersSchema(c.env.DB)
   const profile = c.get('profile')
   const url = new URL(c.req.url)

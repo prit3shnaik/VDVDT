@@ -1,6 +1,7 @@
 import type { Context } from 'hono'
 import type { Env } from '../env'
 import type { AuthedVars } from '../middleware/auth'
+import { r2WorkspacePrefix } from './scope'
 
 export type PhotoSize = 'orig' | 't500'
 
@@ -29,7 +30,19 @@ export async function servePhoto(
     return c.json({ error: 'Missing key' }, 400)
   }
 
-  const object = await c.env.PHOTOS.get(`${size}/${cleanKey}`)
+  const workspace = c.get('workspace')
+  if (!workspace) {
+    return c.json({ error: 'Workspace context required' }, 403)
+  }
+
+  // Photo URLs are stored workspace-relative. Refuse an absolute key that
+  // points at another workspace's prefix.
+  if (cleanKey.startsWith('org/') && !cleanKey.startsWith(r2WorkspacePrefix(workspace.org_id, workspace.id, 'photos'))) {
+    return c.json({ error: 'Forbidden' }, 403)
+  }
+
+  const prefix = r2WorkspacePrefix(workspace.org_id, workspace.id, 'photos')
+  const object = await c.env.PHOTOS.get(`${prefix}${size}/${cleanKey}`)
   if (!object) {
     return c.json({ error: 'Not found' }, 404)
   }

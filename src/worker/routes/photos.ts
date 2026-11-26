@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import type { Env } from '../env'
-import { requireUser, type AuthedVars } from '../middleware/auth'
+import { requireUser, requireWorkspace, type AuthedVars } from '../middleware/auth'
+import { r2WorkspacePrefix } from '../lib/scope'
 import { makeThumbnail, MAX_UPLOAD_BYTES } from '../lib/photos'
 
 export const photos = new Hono<{ Bindings: Env; Variables: AuthedVars }>()
@@ -15,14 +16,16 @@ function guessContentType(key: string): string {
 
 // Body is the raw image bytes. Writes orig/{key} as uploaded and t500/{key} as a
 // one-time 500x500 webp derivative — no resize-on-request, so no Images/Resizing billing.
-photos.put('/api/photos/*', requireUser, async (c) => {
+photos.put('/api/photos/*', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
   if (profile.role !== 'admin' && profile.role !== 'sub-admin' && !profile.can_edit) {
     return c.json({ error: 'Forbidden' }, 403)
   }
 
+  const workspace = c.get('workspace')!
   const key = c.req.path.replace('/api/photos/', '')
-  if (!key) return c.json({ error: 'Missing photo key' }, 400)
+  if (!key || key.includes('..')) return c.json({ error: 'Missing photo key' }, 400)
+  const prefix = r2WorkspacePrefix(workspace.org_id, workspace.id, 'photos')
 
   const bytes = new Uint8Array(await c.req.arrayBuffer())
   if (bytes.byteLength === 0) return c.json({ error: 'Empty file' }, 400)
@@ -30,7 +33,7 @@ photos.put('/api/photos/*', requireUser, async (c) => {
 
   const contentType = c.req.header('content-type') || guessContentType(key)
 
-  await c.env.PHOTOS.put(`orig/${key}`, bytes, { httpMetadata: { contentType } })
+  await c.env.PHOTOS.put(`${prefix}orig/${key}`, bytes, { httpMetadata: { contentType } })
 
   // Some legacy uploads are actually Windows Metafiles (EMF) mislabeled with a .jpg
   // extension (a pre-existing data-quality issue from the original import pipeline, not
@@ -46,7 +49,7 @@ photos.put('/api/photos/*', requireUser, async (c) => {
     thumbContentType = contentType
     thumbnailed = false
   }
-  await c.env.PHOTOS.put(`t500/${key}`, thumbBytes, { httpMetadata: { contentType: thumbContentType } })
+  await c.env.PHOTOS.put(`${prefix}t500/${key}`, thumbBytes, { httpMetadata: { contentType: thumbContentType } })
 
   return c.json({ key, thumbnailed })
 })

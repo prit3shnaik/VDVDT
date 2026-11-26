@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { Env } from '../env'
-import { requireUser, requireAdmin, wardFilter, type AuthedVars } from '../middleware/auth'
+import { requireUser, requireAdmin, requireWorkspace, wardFilter, workspaceFilter, type AuthedVars } from '../middleware/auth'
 import { ensureVotersSchema } from '../lib/schema-ensure'
 
 export const teamLeaders = new Hono<{ Bindings: Env; Variables: AuthedVars }>()
@@ -22,10 +22,10 @@ function parseLeaderIdList(raw: string | null | undefined): string[] {
   }
 }
 
-async function loadUnassignedCountingLeaderIds(db: Env['DB']): Promise<string[]> {
+async function loadUnassignedCountingLeaderIds(db: Env['DB'], workspaceId: string): Promise<string[]> {
   await ensureVotersSchema(db)
-  const row = await db.prepare('SELECT value FROM app_settings WHERE key = ?')
-    .bind(UNASSIGNED_COUNTING_SETTING_KEY)
+  const row = await db.prepare('SELECT value FROM app_settings WHERE workspace_id = ? AND key = ?')
+    .bind(workspaceId, UNASSIGNED_COUNTING_SETTING_KEY)
     .first<{ value: string }>()
   return parseLeaderIdList(row?.value)
 }
@@ -33,12 +33,22 @@ async function loadUnassignedCountingLeaderIds(db: Env['DB']): Promise<string[]>
 // Ward ACL is carried by the linked voter row. LEFT JOIN keeps unlinked/sentinel
 // leader rows (__OFFICE__ / __SHIFTED__) visible, since they have no ward of their own.
 function leaderWardClause(profile: AuthedVars['profile']) {
-  const { clause, params } = wardFilter(profile)
-  if (clause === '1=1') return { clause: '1=1', params: [] as unknown[] }
-  return { clause: `(tl.voter_id IS NULL OR v.id IS NULL OR ${clause.replaceAll('ward_no', 'v.ward_no')})`, params }
+  // Workspace is mandatory even for unlinked special buckets: a sentinel row
+  // belongs to exactly one workspace.
+  const ws = workspaceFilter(profile, 'tl')
+  const admin = profile.is_platform_admin
+    || profile.workspace_role === 'candidate'
+    || profile.workspace_role === 'incharge'
+  if (admin) return ws
+  const wards = profile.allowed_wards.length > 0 ? profile.allowed_wards : [-1]
+  const placeholders = wards.map(() => '?').join(',')
+  return {
+    clause: `${ws.clause} AND (tl.voter_id IS NULL OR v.id IS NULL OR v.ward_no IS NULL OR v.ward_no IN (${placeholders}))`,
+    params: [...ws.params, ...wards],
+  }
 }
 
-teamLeaders.get('/api/team-leaders', requireUser, async (c) => {
+teamLeaders.get('/api/team-leaders', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
   const url = new URL(c.req.url)
   const limit = Math.min(Number(url.searchParams.get('limit') ?? 500) || 500, 500)
@@ -47,8 +57,8 @@ teamLeaders.get('/api/team-leaders', requireUser, async (c) => {
   const partNo = url.searchParams.get('part')
 
   const { clause, params } = leaderWardClause(profile)
-  const { clause: voterClause, params: voterParams } = wardFilter(profile)
-  const unassignedCountingLeaderIds = await loadUnassignedCountingLeaderIds(c.env.DB)
+  const { clause: voterClause, params: voterParams } = wardFilter(profile, 'vv')
+  const unassignedCountingLeaderIds = await loadUnassignedCountingLeaderIds(c.env.DB, c.get('workspace')!.id)
   const extraUnassignedClause = unassignedCountingLeaderIds.length
     ? ` AND tl.id NOT IN (${unassignedCountingLeaderIds.map(() => '?').join(',')})`
     : ''
@@ -64,7 +74,7 @@ teamLeaders.get('/api/team-leaders', requireUser, async (c) => {
     sqlParams.push(Number(partNo))
   }
 
-  const statsWhere = voterClause.replaceAll('ward_no', 'vv.ward_no')
+  const statsWhere = voterClause
   const uniqueStmt = await c.env.DB.prepare(
     `WITH assigned AS (
         SELECT
@@ -139,13 +149,14 @@ teamLeaders.get('/api/team-leaders', requireUser, async (c) => {
   })
 })
 
-teamLeaders.get('/api/team-leaders/unassigned-counting', requireUser, async (c) => {
-  const leaderIds = await loadUnassignedCountingLeaderIds(c.env.DB)
+teamLeaders.get('/api/team-leaders/unassigned-counting', requireUser, requireWorkspace, async (c) => {
+  const leaderIds = await loadUnassignedCountingLeaderIds(c.env.DB, c.get('workspace')!.id)
   return c.json({ leaderIds })
 })
 
-teamLeaders.put('/api/team-leaders/unassigned-counting', requireUser, async (c) => {
+teamLeaders.put('/api/team-leaders/unassigned-counting', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
+  const workspace = c.get('workspace')!
   if (profile.role !== 'admin') return c.json({ error: 'Forbidden' }, 403)
   await ensureVotersSchema(c.env.DB)
   const body = await c.req.json<{ leaderIds?: unknown }>().catch(() => ({} as { leaderIds?: unknown }))
@@ -156,20 +167,21 @@ teamLeaders.put('/api/team-leaders/unassigned-counting', requireUser, async (c) 
     const placeholders = requested.map(() => '?').join(',')
     const { results } = await c.env.DB.prepare(
       `SELECT id FROM team_leaders
-       WHERE id IN (${placeholders})
+       WHERE workspace_id = ? AND id IN (${placeholders})
          AND voter_id IS NULL
+         AND bucket_code IS NULL
          AND (notes IS NULL OR (notes <> '__OFFICE__' AND notes <> '__SHIFTED__' AND notes <> '__RENTED__'))`,
-    ).bind(...requested).all<{ id: string }>()
+    ).bind(workspace.id, ...requested).all<{ id: string }>()
     const allowed = new Set((results ?? []).map((row) => row.id))
     leaderIds = requested.filter((id) => allowed.has(id))
   }
 
   const now = new Date().toISOString()
   await c.env.DB.prepare(
-    `INSERT INTO app_settings (key, value, updated_at, updated_by)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
-  ).bind(UNASSIGNED_COUNTING_SETTING_KEY, JSON.stringify(leaderIds), now, c.get('profile').id).run()
+    `INSERT INTO app_settings (org_id, workspace_id, key, value, updated_at, updated_by)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(workspace_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
+  ).bind(workspace.org_id, workspace.id, UNASSIGNED_COUNTING_SETTING_KEY, JSON.stringify(leaderIds), now, profile.id).run()
 
   return c.json({ leaderIds })
 })
@@ -193,7 +205,7 @@ teamLeaders.get('/api/team-leaders/:id', requireUser, async (c) => {
   if (!teamLeader) return c.json({ error: 'Not found' }, 404)
 
   await ensureVotersSchema(c.env.DB)
-  const { clause: voterClause, params: voterParams } = wardFilter(profile)
+  const { clause: voterClause, params: voterParams } = wardFilter(profile, 'vv')
   const assignmentSelect = `SELECT a.id, a.voter_id, a.assigned_at, a.is_direct,
             v.id AS voter_row_id, v.name, v.epic_no, v.ward_no, v.part_no, v.section,
             v.family_head_epic, v.gender, v.photo_url, v.relative_name, v.relative_relation,
@@ -202,7 +214,7 @@ teamLeaders.get('/api/team-leaders/:id', requireUser, async (c) => {
   const assignmentFrom = `
      FROM team_leader_assignments a
      JOIN voters v ON v.id = a.voter_id
-     WHERE a.team_leader_id = ? AND ${voterClause.replaceAll('ward_no', 'v.ward_no')}
+     WHERE a.workspace_id = ? AND a.team_leader_id = ? AND ${voterClause}
      ORDER BY v.name ASC`
   let assignments
   try {
@@ -210,19 +222,20 @@ teamLeaders.get('/api/team-leaders/:id', requireUser, async (c) => {
       `${assignmentSelect},
             v.parked_address, v.presence_status, v.presence_note${assignmentFrom}`,
     )
-      .bind(c.req.param('id'), ...voterParams)
+      .bind(c.get('workspace')!.id, c.req.param('id'), ...voterParams)
       .all()
   } catch {
     assignments = await c.env.DB.prepare(`${assignmentSelect}${assignmentFrom}`)
-      .bind(c.req.param('id'), ...voterParams)
+      .bind(c.get('workspace')!.id, c.req.param('id'), ...voterParams)
       .all()
   }
 
   return c.json({ teamLeader, assignments: assignments.results ?? [] })
 })
 
-teamLeaders.post('/api/team-leaders', requireUser, async (c) => {
+teamLeaders.post('/api/team-leaders', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
+  const workspace = c.get('workspace')!
   if (!canWrite(profile)) return c.json({ error: 'Forbidden' }, 403)
   await ensureVotersSchema(c.env.DB)
 
@@ -239,15 +252,24 @@ teamLeaders.post('/api/team-leaders', requireUser, async (c) => {
     return c.json({ error: 'voter_id or display_name is required' }, 400)
   }
 
+  if (body.voter_id) {
+    const owned = await c.env.DB.prepare('SELECT id FROM voters WHERE workspace_id = ? AND id = ?')
+      .bind(workspace.id, body.voter_id)
+      .first()
+    if (!owned) return c.json({ error: 'Voter not found in this workspace' }, 404)
+  }
+
   const id = crypto.randomUUID()
   const now = new Date().toISOString()
 
   await c.env.DB.prepare(
-    `INSERT INTO team_leaders (id, voter_id, display_name, part_no, section, notes, assistant_voter_id, created_by, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO team_leaders (id, org_id, workspace_id, voter_id, display_name, part_no, section, notes, assistant_voter_id, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
       id,
+      workspace.org_id,
+      workspace.id,
       body.voter_id ?? null,
       body.display_name?.trim() || null,
       body.part_no ?? null,
@@ -263,13 +285,14 @@ teamLeaders.post('/api/team-leaders', requireUser, async (c) => {
   return c.json({ id }, 201)
 })
 
-teamLeaders.patch('/api/team-leaders/:id', requireUser, async (c) => {
+teamLeaders.patch('/api/team-leaders/:id', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
   if (!canWrite(profile)) return c.json({ error: 'Forbidden' }, 403)
   await ensureVotersSchema(c.env.DB)
 
   const id = c.req.param('id')
-  const existing = await c.env.DB.prepare('SELECT id FROM team_leaders WHERE id = ?').bind(id).first()
+  const workspace = c.get('workspace')!
+  const existing = await c.env.DB.prepare('SELECT id FROM team_leaders WHERE workspace_id = ? AND id = ?').bind(workspace.id, id).first()
   if (!existing) return c.json({ error: 'Not found' }, 404)
 
   const body = await c.req.json<Record<string, unknown>>()
@@ -288,32 +311,34 @@ teamLeaders.patch('/api/team-leaders/:id', requireUser, async (c) => {
   updates.push('updated_at = ?')
   values.push(new Date().toISOString(), id)
 
-  await c.env.DB.prepare(`UPDATE team_leaders SET ${updates.join(', ')} WHERE id = ?`)
-    .bind(...values)
+  await c.env.DB.prepare(`UPDATE team_leaders SET ${updates.join(', ')} WHERE workspace_id = ? AND id = ?`)
+    .bind(...values.slice(0, -1), workspace.id, values[values.length - 1])
     .run()
 
   return c.json({ success: true })
 })
 
-teamLeaders.delete('/api/team-leaders/:id', requireUser, requireAdmin, async (c) => {
+teamLeaders.delete('/api/team-leaders/:id', requireUser, requireWorkspace, requireAdmin, async (c) => {
   const id = c.req.param('id')
-  const existing = await c.env.DB.prepare('SELECT id FROM team_leaders WHERE id = ?').bind(id).first()
+  const workspace = c.get('workspace')!
+  const existing = await c.env.DB.prepare('SELECT id FROM team_leaders WHERE workspace_id = ? AND id = ?').bind(workspace.id, id).first()
   if (!existing) return c.json({ error: 'Not found' }, 404)
 
   // team_leader_assignments cascade via FK ON DELETE CASCADE.
-  await c.env.DB.prepare('DELETE FROM team_leaders WHERE id = ?').bind(id).run()
+  await c.env.DB.prepare('DELETE FROM team_leaders WHERE workspace_id = ? AND id = ?').bind(workspace.id, id).run()
   return c.json({ success: true })
 })
 
 // --- assignments -------------------------------------------------------------
 
 // A voter can only be assigned to one leader (UNIQUE(voter_id)), so this reassigns.
-teamLeaders.post('/api/team-leaders/:id/assignments', requireUser, async (c) => {
+teamLeaders.post('/api/team-leaders/:id/assignments', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
+  const workspace = c.get('workspace')!
   if (!canWrite(profile)) return c.json({ error: 'Forbidden' }, 403)
 
   const leaderId = c.req.param('id')
-  const leader = await c.env.DB.prepare('SELECT id FROM team_leaders WHERE id = ?').bind(leaderId).first()
+  const leader = await c.env.DB.prepare('SELECT id FROM team_leaders WHERE workspace_id = ? AND id = ?').bind(workspace.id, leaderId).first()
   if (!leader) return c.json({ error: 'Not found' }, 404)
 
   const { voter_ids, is_direct } = await c.req.json<{ voter_ids?: string[]; is_direct?: boolean }>()
@@ -323,29 +348,29 @@ teamLeaders.post('/api/team-leaders/:id/assignments', requireUser, async (c) => 
 
   const now = new Date().toISOString()
   const stmt = c.env.DB.prepare(
-    `INSERT INTO team_leader_assignments (id, team_leader_id, voter_id, assigned_by, assigned_at, is_direct)
-     VALUES (?, ?, ?, ?, ?, ?)
-     ON CONFLICT(voter_id) DO UPDATE SET team_leader_id = excluded.team_leader_id,
+    `INSERT INTO team_leader_assignments (id, org_id, workspace_id, team_leader_id, voter_id, assigned_by, assigned_at, is_direct)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(workspace_id, voter_id) DO UPDATE SET team_leader_id = excluded.team_leader_id,
        assigned_by = excluded.assigned_by, assigned_at = excluded.assigned_at, is_direct = excluded.is_direct`
   )
 
   await c.env.DB.batch(
     voter_ids.map((voterId) =>
-      stmt.bind(crypto.randomUUID(), leaderId, voterId, profile.id, now, is_direct ? 1 : 0)
+      stmt.bind(crypto.randomUUID(), workspace.org_id, workspace.id, leaderId, voterId, profile.id, now, is_direct ? 1 : 0)
     )
   )
 
   return c.json({ success: true, assigned: voter_ids.length })
 })
 
-teamLeaders.delete('/api/team-leaders/:id/assignments/:voterId', requireUser, async (c) => {
+teamLeaders.delete('/api/team-leaders/:id/assignments/:voterId', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
   if (!canWrite(profile)) return c.json({ error: 'Forbidden' }, 403)
 
   await c.env.DB.prepare(
-    'DELETE FROM team_leader_assignments WHERE team_leader_id = ? AND voter_id = ?'
+    'DELETE FROM team_leader_assignments WHERE workspace_id = ? AND team_leader_id = ? AND voter_id = ?'
   )
-    .bind(c.req.param('id'), c.req.param('voterId'))
+    .bind(c.get('workspace')!.id, c.req.param('id'), c.req.param('voterId'))
     .run()
 
   return c.json({ success: true })

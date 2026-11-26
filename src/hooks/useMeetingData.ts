@@ -7,7 +7,9 @@ import { buildWardScope, FAST_NAV_CACHE_MAX_AGE_MS, readCachedVoters, writeCache
 import { withNormalizedVoterCategories } from '../lib/voterCategory'
 import { D1_IN_CHUNK } from '../lib/d1Query'
 
-export const MEETING_VOTERS_CACHE_KEY = 'vote:meeting-detail:voters-cache'
+import { workspaceScopedKey } from '../lib/workspace'
+
+export const MEETING_VOTERS_CACHE_KEY = workspaceScopedKey('vote:meeting-detail:voters-cache')
 
 // Mirrors the SQL rule in supabase/migrations/202608060001_global_meeting_merge.sql:
 // the single global meeting is the one with the earliest meeting_date (then

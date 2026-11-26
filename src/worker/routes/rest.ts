@@ -1,12 +1,13 @@
 import { Hono } from 'hono'
 import type { Env } from '../env'
-import { requireUser, type AuthedVars } from '../middleware/auth'
+import { platformDb } from '../env'
+import { requireUser, requireWorkspace, type AuthedVars } from '../middleware/auth'
 import {
   TABLE_POLICIES,
   decodeRow,
   encodeRow,
   satisfies,
-  wardScopeClause,
+  scopeClause,
   type TablePolicy,
 } from '../lib/rest-policy'
 import {
@@ -19,6 +20,7 @@ import {
 } from '../lib/rest-query'
 import { ensureVotersSchema } from '../lib/schema-ensure'
 import { ACTIVE_VOTER_SQL } from '../lib/voter-active'
+import { assertCategoryCode, assertPresenceCode, WorkspaceConfigError } from '../lib/workspace-config'
 
 export const rest = new Hono<{ Bindings: Env; Variables: AuthedVars }>()
 
@@ -29,6 +31,10 @@ function resolvePolicy(table: string): TablePolicy {
   const policy = TABLE_POLICIES[table]
   // Allowlist: anything not explicitly listed is invisible through the shim.
   if (!policy) throw new RestQueryError(`Unknown or forbidden table: ${table}`)
+  // Defense in depth: every campaign table must be workspace-scoped.
+  if (policy.workspaceScope !== 'required') {
+    throw new RestQueryError(`Table is not workspace-scoped: ${table}`)
+  }
   return policy
 }
 
@@ -58,14 +64,34 @@ function prefers(header: string | undefined, token: string): boolean {
 function guardColumns(policy: TablePolicy, row: Record<string, unknown>): void {
   for (const column of Object.keys(row)) {
     assertIdentifier(column)
+    // Ownership columns are server-owned, never client-writable.
+    if (column === 'org_id' || column === 'workspace_id') {
+      throw new RestQueryError(`Column is not writable: ${column}`)
+    }
     if (policy.immutableColumns?.includes(column)) {
       throw new RestQueryError(`Column is not writable: ${column}`)
     }
   }
 }
 
-rest.all('/rest/v1/:table', requireUser, async (c) => {
+async function validateVoterConfig(
+  c: { env: Env; get: (key: 'profile') => AuthedVars['profile'] },
+  row: Record<string, unknown>,
+): Promise<void> {
   const profile = c.get('profile')
+  if (!profile.workspace_id) return
+  const platform = platformDb(c.env)
+  if (row.voter_category !== undefined) {
+    await assertCategoryCode(platform, profile.workspace_id, row.voter_category)
+  }
+  if (row.presence_status !== undefined) {
+    await assertPresenceCode(platform, profile.workspace_id, row.presence_status)
+  }
+}
+
+rest.all('/rest/v1/:table', requireUser, requireWorkspace, async (c) => {
+  const profile = c.get('profile')
+  const workspace = c.get('workspace')!
   const table = c.req.param('table') ?? ''
   const method = c.req.method
   const url = new URL(c.req.url)
@@ -91,7 +117,8 @@ rest.all('/rest/v1/:table', requireUser, async (c) => {
       return c.json({ message: 'Forbidden' }, 403)
     }
 
-    const ward = wardScopeClause(profile, policy)
+    // SECURITY: workspace predicate first, then ward ACL, then client filters.
+    const scope = scopeClause(profile, policy)
     const filters = parseFilters(url.searchParams)
     const preferHeader = c.req.header('prefer')
     const includeInactive = url.searchParams.get('is_active') != null
@@ -103,7 +130,7 @@ rest.all('/rest/v1/:table', requireUser, async (c) => {
     // ---------- READ ----------
     if (method === 'GET' || method === 'HEAD') {
       const columns = parseSelect(url.searchParams.get('select'))
-      const { where, params } = combine([asClause(filters), ward, activeOnly])
+      const { where, params } = combine([asClause(filters), scope, activeOnly])
       const order = parseOrder(url.searchParams.get('order'))
       const { limit, offset } = parseRange(c.req.header('range') ?? null, url.searchParams, MAX_ROWS)
 
@@ -136,10 +163,16 @@ rest.all('/rest/v1/:table', requireUser, async (c) => {
       const incoming = Array.isArray(body) ? body : [body]
       if (incoming.length === 0) return c.json([], 201)
 
-      for (const row of incoming) guardColumns(policy, row)
+      for (const row of incoming) {
+        guardColumns(policy, row)
+        if (table === 'voters') await validateVoterConfig(c, row)
+      }
       const rows = incoming.map((row) => {
         const encoded = encodeRow(policy, row)
         if (policy.autoId !== false && (encoded.id == null || encoded.id === '')) encoded.id = crypto.randomUUID()
+        // Server-owned ownership columns, injected from the session.
+        encoded.org_id = workspace.org_id
+        encoded.workspace_id = workspace.id
         return encoded
       })
 
@@ -157,7 +190,9 @@ rest.all('/rest/v1/:table', requireUser, async (c) => {
           const conflictColumns = (onConflict ?? 'id')
             .split(',')
             .map((col) => assertIdentifier(col.trim()))
-          const updatable = columns.filter((col) => !conflictColumns.includes(col))
+          const updatable = columns.filter(
+            (col) => !conflictColumns.includes(col) && col !== 'org_id' && col !== 'workspace_id',
+          )
           sql += updatable.length
             ? ` ON CONFLICT(${conflictColumns.join(',')}) DO UPDATE SET ${updatable
                 .map((col) => `${col} = excluded.${col}`)
@@ -186,6 +221,7 @@ rest.all('/rest/v1/:table', requireUser, async (c) => {
     if (method === 'PATCH') {
       const incoming = await c.req.json<Record<string, unknown>>()
       guardColumns(policy, incoming)
+      if (table === 'voters') await validateVoterConfig(c, incoming)
       const row = encodeRow(policy, incoming)
 
       const columns = Object.keys(row)
@@ -201,16 +237,18 @@ rest.all('/rest/v1/:table', requireUser, async (c) => {
         if (!epic) return c.json({ message: 'EPIC number is required.' }, 400)
         row.epic_no = epic
         const conflict = await c.env.DB.prepare(
-          `SELECT id FROM voters WHERE epic_no = ?${filters.sql ? ` AND NOT (${filters.sql})` : ''} LIMIT 1`,
+          `SELECT id FROM voters
+           WHERE workspace_id = ? AND epic_no = ?${filters.sql ? ` AND NOT (${filters.sql})` : ''}
+           LIMIT 1`,
         )
-          .bind(epic, ...filters.params)
+          .bind(workspace.id, epic, ...filters.params)
           .first()
         if (conflict) {
-          return c.json({ message: `EPIC number ${epic} already belongs to another voter.` }, 409)
+          return c.json({ message: `EPIC number ${epic} already belongs to another voter in this workspace.` }, 409)
         }
       }
 
-      const { where, params } = combine([asClause(filters), ward])
+      const { where, params } = combine([asClause(filters), scope])
       if (columns.length + params.length > MAX_D1_BINDS) {
         throw new RestQueryError(
           `Too many bound parameters (${columns.length + params.length}). Split IN() filters into chunks of 80 or fewer.`,
@@ -225,8 +263,10 @@ rest.all('/rest/v1/:table', requireUser, async (c) => {
 
       if (!wantRepresentation) return c.body(null, 204)
       const payload = ((result.results ?? []) as Record<string, unknown>[]).map((item) => decodeRow(policy, item))
-      if (wantsSingle(c)) return c.json(payload[0] ?? incoming, 200)
-      return c.json(payload.length ? payload : [incoming], 200)
+      if (wantsSingle(c)) {
+        return payload[0] ? c.json(payload[0], 200) : c.json({ message: 'No rows updated' }, 404)
+      }
+      return c.json(payload, 200)
     }
 
     // ---------- DELETE ----------
@@ -236,7 +276,7 @@ rest.all('/rest/v1/:table', requireUser, async (c) => {
         return c.json({ message: 'DELETE requires a filter' }, 400)
       }
 
-      const { where, params } = combine([asClause(filters), ward])
+      const { where, params } = combine([asClause(filters), scope])
       if (params.length > MAX_D1_BINDS) {
         throw new RestQueryError(
           `Too many bound parameters (${params.length}). Split IN() filters into chunks of 80 or fewer.`,
@@ -249,12 +289,15 @@ rest.all('/rest/v1/:table', requireUser, async (c) => {
 
     return c.json({ message: 'Method not allowed' }, 405)
   } catch (err) {
-    if (err instanceof RestQueryError) {
+    if (err instanceof RestQueryError || err instanceof WorkspaceConfigError) {
       return c.json({ message: err.message }, 400)
     }
     const detail = err instanceof Error ? err.message : String(err)
-    if (table === 'voters' && detail.includes('UNIQUE constraint failed: voters.epic_no')) {
-      return c.json({ message: 'That EPIC number already belongs to another voter.' }, 409)
+    if (
+      table === 'voters' &&
+      detail.includes('UNIQUE constraint failed: voters.workspace_id, voters.epic_no')
+    ) {
+      return c.json({ message: 'That EPIC number already belongs to another voter in this workspace.' }, 409)
     }
     console.error(`[rest] ${method} ${table} failed`, err)
     return c.json({ message: detail || 'Query failed' }, 500)
@@ -262,16 +305,17 @@ rest.all('/rest/v1/:table', requireUser, async (c) => {
 })
 
 /** Only the specific RPCs the app relies on are exposed. */
-rest.post('/rest/v1/rpc/:fn', requireUser, async (c) => {
+rest.post('/rest/v1/rpc/:fn', requireUser, requireWorkspace, async (c) => {
   const profile = c.get('profile')
+  const workspace = c.get('workspace')!
   const fn = c.req.param('fn')
 
   if (fn === 'refresh_dashboard_stats') {
-    if (profile.role !== 'admin' && profile.role !== 'sub-admin') {
+    if (!satisfies(profile, 'admin')) {
       return c.json({ message: 'Forbidden' }, 403)
     }
     const { refreshDashboardStats } = await import('../lib/dashboard-stats')
-    await refreshDashboardStats(c.env.DB)
+    await refreshDashboardStats(c.env.DB, workspace.id, workspace.org_id)
     return c.json(null)
   }
 

@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { z } from 'zod'
 import type { Env } from '../env'
-import { requireUser, requireAdmin, wardFilter, type AuthedVars } from '../middleware/auth'
+import { requireUser, requireAdmin, requireWorkspace, wardFilter, type AuthedVars } from '../middleware/auth'
 import { ensureBoothSchema } from '../lib/schema-ensure'
 import { logActivity } from './activity-logs'
 import { activeVoterSql } from '../lib/voter-active'
@@ -72,9 +72,10 @@ type AgentBooth = {
 async function loadAgentBooths(
   db: Env['DB'],
   userId: string,
+  workspaceId: string,
   electionId?: string,
 ): Promise<AgentBooth[]> {
-  const params: unknown[] = [userId]
+  const params: unknown[] = [userId, workspaceId]
   let extra = ''
   if (electionId) {
     extra = 'AND b.election_id = ?'
@@ -86,7 +87,7 @@ async function loadAgentBooths(
        FROM booth_agents ba
        JOIN booths b ON b.id = ba.booth_id
        JOIN elections e ON e.id = b.election_id
-       WHERE ba.user_id = ? ${extra}`,
+       WHERE ba.user_id = ? AND ba.workspace_id = ? ${extra}`,
     )
     .bind(...params)
     .all<AgentBooth>()
@@ -110,36 +111,37 @@ function ageBandSql(alias = 'v'): string {
   END`
 }
 
-booth.get('/api/booth/elections', requireUser, async (c) => {
+booth.get('/api/booth/elections', requireUser, requireWorkspace, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const { results } = await c.env.DB.prepare(
-    'SELECT * FROM elections ORDER BY poll_date DESC, created_at DESC',
-  ).all()
+    'SELECT * FROM elections WHERE workspace_id = ? ORDER BY poll_date DESC, created_at DESC',
+  ).bind(c.get('workspace')!.id).all()
   return c.json({ elections: results ?? [] })
 })
 
-booth.post('/api/booth/elections', requireUser, requireAdmin, async (c) => {
+booth.post('/api/booth/elections', requireUser, requireWorkspace, requireAdmin, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const parsed = electionCreateSchema.safeParse(await c.req.json())
   if (!parsed.success) return c.json({ error: 'Invalid body' }, 400)
   const profile = c.get('profile')
+  const workspace = c.get('workspace')!
   const id = crypto.randomUUID()
   const now = new Date().toISOString()
   const status = parsed.data.status ?? 'draft'
   await c.env.DB.prepare(
-    `INSERT INTO elections (id, name, poll_date, status, created_by, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO elections (id, org_id, workspace_id, name, poll_date, status, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(id, parsed.data.name, parsed.data.poll_date, status, profile.id, now, now)
+    .bind(id, workspace.org_id, workspace.id, parsed.data.name, parsed.data.poll_date, status, profile.id, now, now)
     .run()
-  await logActivity(c.env, profile.id, 'election_create', 'elections', id, parsed.data)
+  await logActivity(c.env, c.get('workspace'), profile.id, 'election_create', 'elections', id, parsed.data)
   return c.json({ id, status }, 201)
 })
 
-booth.patch('/api/booth/elections/:id', requireUser, requireAdmin, async (c) => {
+booth.patch('/api/booth/elections/:id', requireUser, requireWorkspace, requireAdmin, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const id = c.req.param('id') ?? ''
-  const existing = await c.env.DB.prepare('SELECT id FROM elections WHERE id = ?').bind(id).first()
+  const existing = await c.env.DB.prepare('SELECT id FROM elections WHERE workspace_id = ? AND id = ?').bind(c.get('workspace')!.id, id).first()
   if (!existing) return c.json({ error: 'Not found' }, 404)
   const parsed = electionPatchSchema.safeParse(await c.req.json())
   if (!parsed.success) return c.json({ error: 'Invalid body' }, 400)
@@ -155,48 +157,54 @@ booth.patch('/api/booth/elections/:id', requireUser, requireAdmin, async (c) => 
   const now = new Date().toISOString()
   updates.push('updated_at = ?')
   values.push(now, id)
-  await c.env.DB.prepare(`UPDATE elections SET ${updates.join(', ')} WHERE id = ?`).bind(...values).run()
+  await c.env.DB.prepare(`UPDATE elections SET ${updates.join(', ')} WHERE workspace_id = ? AND id = ?`).bind(...values.slice(0, -1), c.get('workspace')!.id, values[values.length - 1]).run()
   const profile = c.get('profile')
-  await logActivity(c.env, profile.id, 'election_update', 'elections', id, parsed.data)
+  await logActivity(c.env, c.get('workspace'), profile.id, 'election_update', 'elections', id, parsed.data)
   return c.json({ success: true })
 })
 
-booth.get('/api/booth/booths', requireUser, async (c) => {
+booth.get('/api/booth/booths', requireUser, requireWorkspace, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   const electionId = c.req.query('election_id')
   if (!electionId) return c.json({ error: 'election_id is required' }, 400)
+  const wsElection = await c.env.DB.prepare('SELECT id FROM elections WHERE workspace_id = ? AND id = ?')
+    .bind(c.get('workspace')!.id, electionId).first()
+  if (!wsElection) return c.json({ error: 'Election not found' }, 404)
 
   if (isAdmin(profile)) {
     const { results } = await c.env.DB.prepare(
       `SELECT b.*,
-              (SELECT COUNT(*) FROM booth_agents ba WHERE ba.booth_id = b.id) AS agent_count
-       FROM booths b WHERE b.election_id = ? ORDER BY b.part_no, b.section`,
+              (SELECT COUNT(*) FROM booth_agents ba WHERE ba.booth_id = b.id AND ba.workspace_id = b.workspace_id) AS agent_count
+       FROM booths b WHERE b.workspace_id = ? AND b.election_id = ? ORDER BY b.part_no, b.section`,
     )
-      .bind(electionId)
+      .bind(c.get('workspace')!.id, electionId)
       .all()
     return c.json({ booths: results ?? [] })
   }
 
-  const rows = await loadAgentBooths(c.env.DB, profile.id, electionId)
+  const rows = await loadAgentBooths(c.env.DB, profile.id, c.get('workspace')!.id, electionId)
   return c.json({ booths: rows })
 })
 
-booth.post('/api/booth/booths', requireUser, requireAdmin, async (c) => {
+booth.post('/api/booth/booths', requireUser, requireWorkspace, requireAdmin, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const parsed = boothCreateSchema.safeParse(await c.req.json())
   if (!parsed.success) return c.json({ error: 'Invalid body' }, 400)
-  const election = await c.env.DB.prepare('SELECT id FROM elections WHERE id = ?')
-    .bind(parsed.data.election_id)
+  const workspace = c.get('workspace')!
+  const election = await c.env.DB.prepare('SELECT id FROM elections WHERE workspace_id = ? AND id = ?')
+    .bind(workspace.id, parsed.data.election_id)
     .first()
   if (!election) return c.json({ error: 'Election not found' }, 404)
   const id = crypto.randomUUID()
   await c.env.DB.prepare(
-    `INSERT INTO booths (id, election_id, part_no, section, name, location, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO booths (id, org_id, workspace_id, election_id, part_no, section, name, location, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       id,
+      workspace.org_id,
+      workspace.id,
       parsed.data.election_id,
       parsed.data.part_no,
       parsed.data.section ?? null,
@@ -208,7 +216,7 @@ booth.post('/api/booth/booths', requireUser, requireAdmin, async (c) => {
   return c.json({ id }, 201)
 })
 
-booth.get('/api/booth/agents', requireUser, requireAdmin, async (c) => {
+booth.get('/api/booth/agents', requireUser, requireWorkspace, requireAdmin, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const boothId = c.req.query('booth_id')
   const electionId = c.req.query('election_id')
@@ -216,9 +224,9 @@ booth.get('/api/booth/agents', requireUser, requireAdmin, async (c) => {
     const { results } = await c.env.DB.prepare(
       `SELECT ba.*, u.full_name, u.email
        FROM booth_agents ba JOIN users u ON u.id = ba.user_id
-       WHERE ba.booth_id = ? ORDER BY u.full_name`,
+       WHERE ba.workspace_id = ? AND ba.booth_id = ? ORDER BY u.full_name`,
     )
-      .bind(boothId)
+      .bind(c.get('workspace')!.id, boothId)
       .all()
     return c.json({ agents: results ?? [] })
   }
@@ -228,22 +236,23 @@ booth.get('/api/booth/agents', requireUser, requireAdmin, async (c) => {
        FROM booth_agents ba
        JOIN users u ON u.id = ba.user_id
        JOIN booths b ON b.id = ba.booth_id
-       WHERE b.election_id = ? ORDER BY b.part_no, u.full_name`,
+       WHERE ba.workspace_id = ? AND b.election_id = ? ORDER BY b.part_no, u.full_name`,
     )
-      .bind(electionId)
+      .bind(c.get('workspace')!.id, electionId)
       .all()
     return c.json({ agents: results ?? [] })
   }
   return c.json({ error: 'booth_id or election_id is required' }, 400)
 })
 
-booth.post('/api/booth/agents', requireUser, requireAdmin, async (c) => {
+booth.post('/api/booth/agents', requireUser, requireWorkspace, requireAdmin, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   const parsed = agentAssignSchema.safeParse(await c.req.json())
   if (!parsed.success) return c.json({ error: 'Invalid body' }, 400)
-  const boothRow = await c.env.DB.prepare('SELECT id FROM booths WHERE id = ?')
-    .bind(parsed.data.booth_id)
+  const workspace = c.get('workspace')!
+  const boothRow = await c.env.DB.prepare('SELECT id FROM booths WHERE workspace_id = ? AND id = ?')
+    .bind(workspace.id, parsed.data.booth_id)
     .first()
   if (!boothRow) return c.json({ error: 'Booth not found' }, 404)
   const userRow = await c.env.DB.prepare('SELECT id FROM users WHERE id = ?')
@@ -253,25 +262,27 @@ booth.post('/api/booth/agents', requireUser, requireAdmin, async (c) => {
   const id = crypto.randomUUID()
   try {
     await c.env.DB.prepare(
-      `INSERT INTO booth_agents (id, booth_id, user_id, assigned_by, assigned_at)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO booth_agents (id, org_id, workspace_id, booth_id, user_id, assigned_by, assigned_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
-      .bind(id, parsed.data.booth_id, parsed.data.user_id, profile.id, new Date().toISOString())
+      .bind(id, workspace.org_id, workspace.id, parsed.data.booth_id, parsed.data.user_id, profile.id, new Date().toISOString())
       .run()
   } catch {
     return c.json({ error: 'Already assigned' }, 409)
   }
-  await logActivity(c.env, profile.id, 'booth_agent_assign', 'booth_agents', id, parsed.data)
+  await logActivity(c.env, c.get('workspace'), profile.id, 'booth_agent_assign', 'booth_agents', id, parsed.data)
   return c.json({ id }, 201)
 })
 
-booth.delete('/api/booth/agents/:id', requireUser, requireAdmin, async (c) => {
+booth.delete('/api/booth/agents/:id', requireUser, requireWorkspace, requireAdmin, async (c) => {
   await ensureBoothSchema(c.env.DB)
-  await c.env.DB.prepare('DELETE FROM booth_agents WHERE id = ?').bind(c.req.param('id')).run()
+  await c.env.DB.prepare('DELETE FROM booth_agents WHERE workspace_id = ? AND id = ?')
+    .bind(c.get('workspace')!.id, c.req.param('id'))
+    .run()
   return c.json({ success: true })
 })
 
-booth.get('/api/booth/me', requireUser, async (c) => {
+booth.get('/api/booth/me', requireUser, requireWorkspace, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   if (isAdmin(profile)) {
@@ -279,8 +290,9 @@ booth.get('/api/booth/me', requireUser, async (c) => {
       `SELECT b.id, b.election_id, b.part_no, b.section, b.name, b.location, e.status AS election_status,
               e.name AS election_name, e.poll_date
        FROM booths b JOIN elections e ON e.id = b.election_id
+       WHERE b.workspace_id = ?
        ORDER BY e.poll_date DESC, b.part_no`,
-    ).all()
+    ).bind(c.get('workspace')!.id).all()
     return c.json({ admin: true, booths: results ?? [] })
   }
   const { results } = await c.env.DB.prepare(
@@ -289,15 +301,15 @@ booth.get('/api/booth/me', requireUser, async (c) => {
      FROM booth_agents ba
      JOIN booths b ON b.id = ba.booth_id
      JOIN elections e ON e.id = b.election_id
-     WHERE ba.user_id = ?
+     WHERE ba.user_id = ? AND ba.workspace_id = ?
      ORDER BY e.poll_date DESC, b.part_no`,
   )
-    .bind(profile.id)
+    .bind(profile.id, c.get('workspace')!.id)
     .all()
   return c.json({ admin: false, booths: results ?? [] })
 })
 
-booth.post('/api/booth/attendance', requireUser, async (c) => {
+booth.post('/api/booth/attendance', requireUser, requireWorkspace, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   const parsed = attendanceSchema.safeParse(await c.req.json())
@@ -317,15 +329,15 @@ booth.post('/api/booth/attendance', requireUser, async (c) => {
     return c.json({ ok: true, duplicate: true, mark: existingEvent })
   }
 
-  const election = await c.env.DB.prepare('SELECT id, status FROM elections WHERE id = ?')
-    .bind(body.election_id)
+  const election = await c.env.DB.prepare('SELECT id, status FROM elections WHERE workspace_id = ? AND id = ?')
+    .bind(c.get('workspace')!.id, body.election_id)
     .first<{ id: string; status: string }>()
   if (!election) return c.json({ error: 'Election not found' }, 404)
   if (election.status !== 'open' && !isAdmin(profile)) {
     return c.json({ error: 'Marking is closed for this election' }, 403)
   }
 
-  const agentBooths = isAdmin(profile) ? [] : await loadAgentBooths(c.env.DB, profile.id, body.election_id)
+  const agentBooths = isAdmin(profile) ? [] : await loadAgentBooths(c.env.DB, profile.id, c.get('workspace')!.id, body.election_id)
   if (!isAdmin(profile) && agentBooths.length === 0) {
     return c.json({ error: 'No booth assignment' }, 403)
   }
@@ -335,9 +347,9 @@ booth.post('/api/booth/attendance', requireUser, async (c) => {
     if (isAdmin(profile)) {
       const row = await c.env.DB.prepare(
         `SELECT b.id, b.election_id, b.part_no, b.section, b.name, b.location, e.status AS election_status
-         FROM booths b JOIN elections e ON e.id = b.election_id WHERE b.id = ? AND b.election_id = ?`,
+         FROM booths b JOIN elections e ON e.id = b.election_id WHERE b.workspace_id = ? AND b.id = ? AND b.election_id = ?`,
       )
-        .bind(body.booth_id, body.election_id)
+        .bind(c.get('workspace')!.id, body.booth_id, body.election_id)
         .first<AgentBooth>()
       if (!row) return c.json({ error: 'Booth not found' }, 404)
       boothRow = row
@@ -421,9 +433,9 @@ booth.post('/api/booth/attendance', requireUser, async (c) => {
 
   if (!boothRow) {
     const fallback = await c.env.DB.prepare(
-      'SELECT id, election_id, part_no, section, name, location FROM booths WHERE election_id = ? AND part_no = ? LIMIT 1',
+      'SELECT id, election_id, part_no, section, name, location FROM booths WHERE workspace_id = ? AND election_id = ? AND part_no = ? LIMIT 1',
     )
-      .bind(body.election_id, voter.part_no)
+      .bind(c.get('workspace')!.id, body.election_id, voter.part_no)
       .first<AgentBooth>()
     if (!fallback) return c.json({ error: 'No booth for this part' }, 400)
     boothRow = fallback
@@ -449,11 +461,13 @@ booth.post('/api/booth/attendance', requireUser, async (c) => {
   try {
     await c.env.DB.prepare(
       `INSERT INTO voter_turnout
-        (id, election_id, voter_id, booth_id, status, marked_at, marked_by, source, client_event_id, lat, lng)
-       VALUES (?, ?, ?, ?, 'voted', ?, ?, ?, ?, ?, ?)`,
+        (id, org_id, workspace_id, election_id, voter_id, booth_id, status, marked_at, marked_by, source, client_event_id, lat, lng)
+       VALUES (?, ?, ?, ?, ?, ?, 'voted', ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         id,
+        c.get('workspace')!.org_id,
+        c.get('workspace')!.id,
         body.election_id,
         voter.id,
         boothRow.id,
@@ -472,14 +486,14 @@ booth.post('/api/booth/attendance', requireUser, async (c) => {
       .bind(body.election_id, voter.id)
       .first()
     if (raced) return c.json({ error: 'already_marked', mark: raced }, 409)
-    const dup = await c.env.DB.prepare('SELECT * FROM voter_turnout WHERE client_event_id = ?')
-      .bind(body.event_id)
+    const dup = await c.env.DB.prepare('SELECT * FROM voter_turnout WHERE workspace_id = ? AND client_event_id = ?')
+      .bind(c.get('workspace')!.id, body.event_id)
       .first()
     if (dup) return c.json({ ok: true, duplicate: true, mark: dup })
     return c.json({ error: 'Failed to mark' }, 500)
   }
 
-  await logActivity(c.env, profile.id, 'turnout_mark', 'voter_turnout', id, {
+  await logActivity(c.env, c.get('workspace'), profile.id, 'turnout_mark', 'voter_turnout', id, {
     election_id: body.election_id,
     voter_id: voter.id,
     booth_id: boothRow.id,
@@ -504,7 +518,7 @@ booth.post('/api/booth/attendance', requireUser, async (c) => {
   }, 201)
 })
 
-booth.post('/api/booth/attendance/override', requireUser, requireAdmin, async (c) => {
+booth.post('/api/booth/attendance/override', requireUser, requireWorkspace, requireAdmin, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   const parsed = overrideSchema.safeParse(await c.req.json())
@@ -512,9 +526,9 @@ booth.post('/api/booth/attendance/override', requireUser, requireAdmin, async (c
   const body = parsed.data
 
   const existingEvent = await c.env.DB.prepare(
-    'SELECT * FROM voter_turnout WHERE client_event_id = ?',
+    'SELECT * FROM voter_turnout WHERE workspace_id = ? AND client_event_id = ?',
   )
-    .bind(body.event_id)
+    .bind(c.get('workspace')!.id, body.event_id)
     .first()
   if (existingEvent) return c.json({ ok: true, duplicate: true, mark: existingEvent })
 
@@ -527,9 +541,9 @@ booth.post('/api/booth/attendance/override', requireUser, requireAdmin, async (c
   let boothId = body.booth_id
   if (!boothId) {
     const boothRow = await c.env.DB.prepare(
-      'SELECT id FROM booths WHERE election_id = ? AND part_no = ? LIMIT 1',
+      'SELECT id FROM booths WHERE workspace_id = ? AND election_id = ? AND part_no = ? LIMIT 1',
     )
-      .bind(body.election_id, voter.part_no)
+      .bind(c.get('workspace')!.id, body.election_id, voter.part_no)
       .first<{ id: string }>()
     boothId = boothRow?.id
   }
@@ -537,9 +551,9 @@ booth.post('/api/booth/attendance/override', requireUser, requireAdmin, async (c
 
   const now = new Date().toISOString()
   const current = await c.env.DB.prepare(
-    'SELECT * FROM voter_turnout WHERE election_id = ? AND voter_id = ?',
+    'SELECT * FROM voter_turnout WHERE workspace_id = ? AND election_id = ? AND voter_id = ?',
   )
-    .bind(body.election_id, body.voter_id)
+    .bind(c.get('workspace')!.id, body.election_id, body.voter_id)
     .first<{ id: string }>()
 
   if (current) {
@@ -550,18 +564,20 @@ booth.post('/api/booth/attendance/override', requireUser, requireAdmin, async (c
     )
       .bind(body.status, boothId, body.note ?? null, profile.id, now, current.id)
       .run()
-    await logActivity(c.env, profile.id, 'turnout_override', 'voter_turnout', current.id, body)
+    await logActivity(c.env, c.get('workspace'), profile.id, 'turnout_override', 'voter_turnout', current.id, body)
     return c.json({ ok: true, id: current.id })
   }
 
   const id = crypto.randomUUID()
   await c.env.DB.prepare(
     `INSERT INTO voter_turnout
-      (id, election_id, voter_id, booth_id, status, marked_at, marked_by, source, client_event_id, override_note, overridden_by, overridden_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'epic', ?, ?, ?, ?)`,
+      (id, org_id, workspace_id, election_id, voter_id, booth_id, status, marked_at, marked_by, source, client_event_id, override_note, overridden_by, overridden_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'epic', ?, ?, ?, ?)`,
   )
     .bind(
       id,
+      c.get('workspace')!.org_id,
+      c.get('workspace')!.id,
       body.election_id,
       body.voter_id,
       boothId,
@@ -574,20 +590,23 @@ booth.post('/api/booth/attendance/override', requireUser, requireAdmin, async (c
       now,
     )
     .run()
-  await logActivity(c.env, profile.id, 'turnout_override', 'voter_turnout', id, body)
+  await logActivity(c.env, c.get('workspace'), profile.id, 'turnout_override', 'voter_turnout', id, body)
   return c.json({ ok: true, id }, 201)
 })
 
-booth.get('/api/booth/attendance/summary', requireUser, async (c) => {
+booth.get('/api/booth/attendance/summary', requireUser, requireWorkspace, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   const electionId = c.req.query('election_id')
   if (!electionId) return c.json({ error: 'election_id is required' }, 400)
+  const wsElection = await c.env.DB.prepare('SELECT id FROM elections WHERE workspace_id = ? AND id = ?')
+    .bind(c.get('workspace')!.id, electionId).first()
+  if (!wsElection) return c.json({ error: 'Election not found' }, 404)
   const partNo = c.req.query('part_no')
   const boothId = c.req.query('booth_id')
 
   if (!isAdmin(profile)) {
-    const mine = await loadAgentBooths(c.env.DB, profile.id, electionId)
+    const mine = await loadAgentBooths(c.env.DB, profile.id, c.get('workspace')!.id, electionId)
     if (mine.length === 0) return c.json({ error: 'Forbidden' }, 403)
     if (boothId && !mine.some((b) => b.id === boothId)) return c.json({ error: 'Forbidden' }, 403)
     if (partNo && !mine.some((b) => String(b.part_no) === partNo)) return c.json({ error: 'Forbidden' }, 403)
@@ -737,7 +756,7 @@ booth.get('/api/booth/attendance/summary', requireUser, async (c) => {
   })
 })
 
-booth.get('/api/booth/attendance/unmarked', requireUser, async (c) => {
+booth.get('/api/booth/attendance/unmarked', requireUser, requireWorkspace, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   const electionId = c.req.query('election_id')
@@ -745,7 +764,7 @@ booth.get('/api/booth/attendance/unmarked', requireUser, async (c) => {
   if (!electionId || !partNo) return c.json({ error: 'election_id and part_no are required' }, 400)
 
   if (!isAdmin(profile)) {
-    const mine = await loadAgentBooths(c.env.DB, profile.id, electionId)
+    const mine = await loadAgentBooths(c.env.DB, profile.id, c.get('workspace')!.id, electionId)
     if (!mine.some((b) => String(b.part_no) === partNo)) return c.json({ error: 'Forbidden' }, 403)
   }
 
@@ -769,15 +788,18 @@ booth.get('/api/booth/attendance/unmarked', requireUser, async (c) => {
   return c.json({ unmarked: results ?? [] })
 })
 
-booth.get('/api/booth/attendance/marked', requireUser, async (c) => {
+booth.get('/api/booth/attendance/marked', requireUser, requireWorkspace, async (c) => {
   await ensureBoothSchema(c.env.DB)
   const profile = c.get('profile')
   const electionId = c.req.query('election_id')
   if (!electionId) return c.json({ error: 'election_id is required' }, 400)
+  const wsElection = await c.env.DB.prepare('SELECT id FROM elections WHERE workspace_id = ? AND id = ?')
+    .bind(c.get('workspace')!.id, electionId).first()
+  if (!wsElection) return c.json({ error: 'Election not found' }, 404)
   const boothId = c.req.query('booth_id')
 
   if (!isAdmin(profile)) {
-    const mine = await loadAgentBooths(c.env.DB, profile.id, electionId)
+    const mine = await loadAgentBooths(c.env.DB, profile.id, c.get('workspace')!.id, electionId)
     if (mine.length === 0) return c.json({ error: 'Forbidden' }, 403)
     if (boothId && !mine.some((b) => b.id === boothId)) return c.json({ error: 'Forbidden' }, 403)
   }
